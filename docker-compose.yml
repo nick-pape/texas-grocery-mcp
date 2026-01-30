@@ -1,0 +1,32 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  texas-grocery-mcp:
+    build: .
+    volumes:
+      # Mount auth state from host
+      - ~/.texas-grocery-mcp:/home/appuser/.texas-grocery-mcp
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - HEB_DEFAULT_STORE=${HEB_DEFAULT_STORE:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+  redis:
+    image: redis:7-alpine
+    # Port exposed only within Docker network for security
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
