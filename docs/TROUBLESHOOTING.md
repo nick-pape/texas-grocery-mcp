@@ -371,7 +371,7 @@ If you're still stuck:
 1. **Check session status:** `session_status()` - provides diagnostic info
 2. **Check health:** `health_ready()` - shows component status
 3. **Enable debug logging:** Set `LOG_LEVEL=DEBUG` environment variable
-4. **Report issues:** https://github.com/<YOUR_GITHUB_USER_OR_ORG>/texas-grocery-mcp/issues
+4. **Report issues:** https://github.com/mgwalkerjr95/texas-grocery-mcp/issues
 
 When reporting issues, include:
 - The error message/code
