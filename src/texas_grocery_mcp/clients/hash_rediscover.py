@@ -45,7 +45,31 @@ logger = structlog.get_logger()
 
 
 # Pages whose first paint triggers each tracked GraphQL operation.
-# Add a URL when a new operation rotates and isn't captured here.
+# Map operation_name -> tuple of URLs whose page-load JS fires that op.
+# When the client knows which op rotated, we visit ONLY the relevant
+# page(s) — typically one — instead of broadcasting the full sweep.
+# Other ops that happen to fire on the same page get captured for free.
+#
+# Mutations that only fire on user clicks (cartItemV2,
+# SelectPickupFulfillment, CouponClip) intentionally have no entry here
+# — passive page-load can't trigger them. For those, the broadcast
+# fallback runs but won't recover the hash; manual override is the
+# escape hatch.
+OPERATION_PAGES: dict[str, tuple[str, ...]] = {
+    "ShopNavigation": ("https://www.heb.com/",),
+    "alertEntryPoint": ("https://www.heb.com/",),
+    "cartEstimated": ("https://www.heb.com/cart",),
+    "typeaheadContent": ("https://www.heb.com/search?q=milk",),
+    "StoreSearch": ("https://www.heb.com/store-locations",),
+    # Non-default ops we've observed firing on these pages:
+    "entryPoint": ("https://www.heb.com/",),
+    "getFrequentlyPurchasedProducts": ("https://www.heb.com/cart",),
+    "historicCashbackEstimate": ("https://www.heb.com/cart",),
+    "shoppingListCarouselV2": ("https://www.heb.com/",),
+}
+
+# Used when no target_operation is given (or its op isn't in
+# OPERATION_PAGES). Visit a small spread that exercises common ops.
 DEFAULT_DISCOVERY_URLS: tuple[str, ...] = (
     "https://www.heb.com/",
     "https://www.heb.com/cart",
@@ -60,15 +84,32 @@ DEFAULT_OVERALL_TIMEOUT_S = 60.0
 async def rediscover_hashes(
     *,
     auth_state_path: Path | None = None,
-    urls: tuple[str, ...] = DEFAULT_DISCOVERY_URLS,
+    target_operation: str | None = None,
+    urls: tuple[str, ...] | None = None,
     page_timeout_ms: int = DEFAULT_PAGE_TIMEOUT_MS,
     overall_timeout_s: float = DEFAULT_OVERALL_TIMEOUT_S,
 ) -> dict[str, str]:
     """Sweep HEB pages, capture persisted-query hashes from outgoing GraphQL.
 
+    When ``target_operation`` is given and known to ``OPERATION_PAGES``,
+    only the pages associated with that op are visited — typically one
+    page, ~5-10s instead of the full ~30-60s broadcast. Any *other* ops
+    that happen to fire on the same page are captured opportunistically.
+
+    When ``target_operation`` is None or unknown, falls back to
+    ``DEFAULT_DISCOVERY_URLS`` (broadcast).
+
+    ``urls`` overrides both selection paths (used for tests/debugging).
+
     Returns a dict of ``operationName -> sha256Hash`` for every operation
-    observed. May be partial if a tracked op doesn't fire during the sweep.
+    observed. May be partial if the rotated op doesn't fire passively
+    (mutations need an interactive flow we don't simulate here).
     """
+    if urls is None:
+        if target_operation and target_operation in OPERATION_PAGES:
+            urls = OPERATION_PAGES[target_operation]
+        else:
+            urls = DEFAULT_DISCOVERY_URLS
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:

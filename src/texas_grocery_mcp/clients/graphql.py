@@ -392,6 +392,7 @@ class HEBGraphQLClient:
 
             new_hashes = await rediscover_hashes(
                 auth_state_path=settings.auth_state_path,
+                target_operation=operation_name,
             )
         except Exception as e:  # noqa: BLE001
             logger.error(
