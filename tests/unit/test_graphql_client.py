@@ -102,9 +102,7 @@ async def test_typeahead_success(client):
         }
     }
 
-    respx.post("https://www.heb.com/graphql").mock(
-        return_value=Response(200, json=mock_response)
-    )
+    respx.post("https://www.heb.com/graphql").mock(return_value=Response(200, json=mock_response))
 
     suggestions = await client.get_typeahead("milk")
 
@@ -137,9 +135,7 @@ async def test_search_products_uses_typeahead(client, monkeypatch):
         }
     }
 
-    respx.post("https://www.heb.com/graphql").mock(
-        return_value=Response(200, json=mock_response)
-    )
+    respx.post("https://www.heb.com/graphql").mock(return_value=Response(200, json=mock_response))
 
     result = await client.search_products(query="milk", store_id="590")
 
@@ -170,9 +166,7 @@ async def test_get_categories_success(client):
         }
     }
 
-    respx.post("https://www.heb.com/graphql").mock(
-        return_value=Response(200, json=mock_response)
-    )
+    respx.post("https://www.heb.com/graphql").mock(return_value=Response(200, json=mock_response))
 
     categories = await client.get_categories()
 
@@ -190,9 +184,7 @@ async def test_handles_graphql_error(client):
         "data": None,
     }
 
-    respx.post("https://www.heb.com/graphql").mock(
-        return_value=Response(200, json=mock_response)
-    )
+    respx.post("https://www.heb.com/graphql").mock(return_value=Response(200, json=mock_response))
 
     # Test the underlying method directly (get_typeahead catches errors)
     with pytest.raises(GraphQLError, match="Invalid query"):
@@ -205,7 +197,16 @@ async def test_handles_graphql_error(client):
 @pytest.mark.asyncio
 @respx.mock
 async def test_persisted_query_not_found_error(client):
-    """Should raise PersistedQueryNotFoundError when hash is invalid."""
+    """Should raise PersistedQueryNotFoundError when hash is invalid.
+
+    The fork adds self-heal-on-stale-hash: on PersistedQueryNotFound,
+    the client invokes hash_rediscover to refresh the hash and retries
+    once. This test asserts the error STILL propagates when rediscovery
+    can't recover (returns empty), so we mock the rediscovery call.
+    Live Playwright must NOT be invoked in unit tests.
+    """
+    from unittest.mock import AsyncMock, patch
+
     mock_response = {
         "errors": [
             {
@@ -216,14 +217,17 @@ async def test_persisted_query_not_found_error(client):
         "data": None,
     }
 
-    respx.post("https://www.heb.com/graphql").mock(
-        return_value=Response(200, json=mock_response)
-    )
+    respx.post("https://www.heb.com/graphql").mock(return_value=Response(200, json=mock_response))
 
     from texas_grocery_mcp.clients.graphql import PersistedQueryNotFoundError
 
-    # Test the underlying method directly
-    with pytest.raises(PersistedQueryNotFoundError):
+    with (
+        patch(
+            "texas_grocery_mcp.clients.hash_rediscover.rediscover_hashes",
+            AsyncMock(return_value={}),
+        ),
+        pytest.raises(PersistedQueryNotFoundError),
+    ):
         await client._execute_persisted_query(
             "typeaheadContent",
             {"term": "test", "searchMode": "MAIN_SEARCH"},
@@ -273,10 +277,12 @@ def test_client_throttlers_use_settings(monkeypatch):
     import importlib
 
     import texas_grocery_mcp.utils.config as config_module
+
     importlib.reload(config_module)
 
     # Also reload the graphql module so it uses fresh settings
     import texas_grocery_mcp.clients.graphql as graphql_module
+
     importlib.reload(graphql_module)
 
     try:
@@ -398,24 +404,10 @@ async def test_select_store_verifies_actual_change():
     from unittest.mock import AsyncMock, MagicMock, patch
 
     # Mock the mutation response (empty but not error)
-    mock_mutation_response = {
-        "data": {
-            "selectPickupFulfillment": {}
-        }
-    }
+    mock_mutation_response = {"data": {"selectPickupFulfillment": {}}}
 
     # Mock the cart response that shows the store actually changed
-    mock_cart_response = {
-        "data": {
-            "cartV2": {
-                "fulfillment": {
-                    "store": {
-                        "id": "699"
-                    }
-                }
-            }
-        }
-    }
+    mock_cart_response = {"data": {"cartV2": {"fulfillment": {"store": {"id": "699"}}}}}
 
     with patch.object(client, "_get_authenticated_client") as mock_get_auth:
         mock_auth_client = MagicMock()
@@ -458,11 +450,7 @@ async def test_select_store_detects_verification_failure():
     from unittest.mock import AsyncMock, MagicMock, patch
 
     # Mock the mutation response (appears successful)
-    mock_mutation_response = {
-        "data": {
-            "selectPickupFulfillment": {}
-        }
-    }
+    mock_mutation_response = {"data": {"selectPickupFulfillment": {}}}
 
     # Mock the cart response showing store DIDN'T change (cart conflict scenario)
     mock_cart_response = {

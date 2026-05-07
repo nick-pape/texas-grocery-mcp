@@ -4,8 +4,10 @@ Supports both unauthenticated (typeahead) and authenticated (full product search
 modes. Authenticated mode uses browser session cookies for faster API access.
 """
 
+import asyncio
 import json
 import re
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -55,9 +57,11 @@ class PersistedQueryNotFoundError(Exception):
     pass
 
 
-# Persisted Query Hashes (discovered via reverse engineering)
-# These may change when HEB deploys new code
-PERSISTED_QUERIES = {
+# Persisted Query Hashes (discovered via reverse engineering).
+# HEB rotates these when their frontend ships new code; the HashStore
+# below tracks rotations at runtime and persists overrides so we don't
+# need a code release every time.
+DEFAULT_PERSISTED_QUERIES = {
     "ShopNavigation": "0e669423cef683226cb8eb295664619c8e0f95945734e0a458095f51ee89efb3",
     "alertEntryPoint": "3e3ccd248652e8fce4674d0c5f3f30f2ddc63da277bfa0ff36ea9420e5dffd5e",
     "cartEstimated": "7b033abaf2caa80bc49541e51d2b89e3cc6a316e37c4bd576d9b5c498a51e9c5",
@@ -68,6 +72,118 @@ PERSISTED_QUERIES = {
     # Store change mutation - changes the active pickup store
     "SelectPickupFulfillment": "8fa3c683ee37ad1bab9ce22b99bd34315b2a89cfc56208d63ba9efc0c49a6323",
 }
+
+
+class HashStore:
+    """Mutable registry of persisted-query hashes with on-disk override cache.
+
+    Behaves like a read-only dict for callers (`store[op]`, `op in store`).
+    When HEB rotates a hash, ``rotate()`` updates the in-memory entry and
+    writes the override to ``cache_path`` — so the next process spawn loads
+    the rotated hash directly without going through rediscovery again.
+
+    The cache file stores ONLY entries that diverge from defaults. That
+    keeps the file small and makes it obvious which hashes have rotated.
+    """
+
+    def __init__(
+        self,
+        defaults: dict[str, str],
+        cache_path: Path | None = None,
+    ) -> None:
+        self._defaults = dict(defaults)
+        self._cache_path = cache_path
+        self._lock = asyncio.Lock()
+        self._effective: dict[str, str] = {**self._defaults, **self._load_overrides()}
+
+    def _load_overrides(self) -> dict[str, str]:
+        if not self._cache_path or not self._cache_path.exists():
+            return {}
+        try:
+            data = json.loads(self._cache_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                "hash overrides cache unreadable; starting fresh",
+                path=str(self._cache_path),
+                error=str(e),
+            )
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+
+    def __contains__(self, op: object) -> bool:
+        return op in self._effective
+
+    def __getitem__(self, op: str) -> str:
+        return self._effective[op]
+
+    def __iter__(self):
+        return iter(self._effective)
+
+    def __len__(self) -> int:
+        return len(self._effective)
+
+    def get(self, op: str, default: str | None = None) -> str | None:
+        return self._effective.get(op, default)
+
+    def items(self):
+        return self._effective.items()
+
+    def keys(self):
+        return self._effective.keys()
+
+    @property
+    def overrides(self) -> dict[str, str]:
+        """Entries that diverge from defaults (i.e., rotations we've recorded)."""
+        return {k: v for k, v in self._effective.items() if v != self._defaults.get(k)}
+
+    async def rotate(self, new: dict[str, str]) -> dict[str, str]:
+        """Apply discovered hashes; persist overrides; return changed entries.
+
+        Empty/falsy values are ignored. Unknown operation names are accepted
+        (HEB might add ones we don't track yet) but won't help us until a
+        call site references them — they're stored anyway as future-proofing.
+        """
+        async with self._lock:
+            changed: dict[str, str] = {}
+            for op, val in new.items():
+                if not val:
+                    continue
+                if self._effective.get(op) != val:
+                    self._effective[op] = val
+                    changed[op] = val
+            if changed and self._cache_path is not None:
+                try:
+                    self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._cache_path.write_text(
+                        json.dumps(self.overrides, indent=2, sort_keys=True)
+                    )
+                except OSError as e:
+                    logger.error(
+                        "failed to persist hash overrides",
+                        path=str(self._cache_path),
+                        error=str(e),
+                    )
+            return changed
+
+
+def _default_overrides_path() -> Path:
+    """Default cache path: sibling of auth.json so per-identity volume mounts catch it."""
+    settings = get_settings()
+    override = settings.hash_overrides_path
+    if override is not None:
+        return override
+    return settings.auth_state_path.parent / "hash_overrides.json"
+
+
+# Module-level HashStore — the existing call sites use `PERSISTED_QUERIES[op]`
+# and `op in PERSISTED_QUERIES`, both of which the HashStore implements. So
+# replacing the dict literal with a HashStore is a drop-in change.
+PERSISTED_QUERIES = HashStore(
+    defaults=DEFAULT_PERSISTED_QUERIES,
+    cache_path=_default_overrides_path(),
+)
 
 # Well-known HEB stores (fallback for store search)
 KNOWN_STORES = {
@@ -231,7 +347,7 @@ class HEBGraphQLClient:
 
         # Look for build ID in the HTML
         # Pattern: /_next/static/{buildId}/_buildManifest.js
-        match = re.search(r'/_next/static/([a-zA-Z0-9_-]+)/_buildManifest\.js', response.text)
+        match = re.search(r"/_next/static/([a-zA-Z0-9_-]+)/_buildManifest\.js", response.text)
         if match:
             self._build_id = match.group(1)
             logger.info("Extracted Next.js build ID", build_id=self._build_id)
@@ -252,11 +368,67 @@ class HEBGraphQLClient:
         )
         raise RuntimeError("Could not extract Next.js build ID from HEB homepage")
 
+    async def _try_self_heal(self, operation_name: str) -> bool:
+        """Rediscover hashes for HEB and rotate the store; return True if a
+        new hash for ``operation_name`` was applied.
+
+        On True, the caller should retry the in-flight request once. On
+        False, the caller should re-raise the original
+        ``PersistedQueryNotFoundError`` — either rediscovery is disabled,
+        the rediscovery sweep failed, or the rediscovery did not observe
+        the rotated operation (e.g., it's a mutation that only fires on
+        an interaction we don't simulate). Self-heal is opt-out via
+        ``settings.hash_self_heal_enabled``.
+        """
+        settings = get_settings()
+        if not settings.hash_self_heal_enabled:
+            return False
+        logger.info(
+            "persisted-query hash stale; attempting rediscovery",
+            operation=operation_name,
+        )
+        try:
+            from texas_grocery_mcp.clients.hash_rediscover import rediscover_hashes
+
+            new_hashes = await rediscover_hashes(
+                auth_state_path=settings.auth_state_path,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "hash rediscovery failed",
+                operation=operation_name,
+                error=str(e),
+            )
+            return False
+        if not new_hashes:
+            logger.warning(
+                "hash rediscovery returned no hashes",
+                operation=operation_name,
+            )
+            return False
+        changed = await PERSISTED_QUERIES.rotate(new_hashes)
+        if operation_name in changed:
+            logger.info(
+                "persisted-query hash rotated; retrying request",
+                operation=operation_name,
+                new_hash=changed[operation_name],
+            )
+            return True
+        logger.warning(
+            "rediscovery did not observe the stale operation",
+            operation=operation_name,
+            captured=sorted(new_hashes),
+            rotated=sorted(changed),
+        )
+        return False
+
     @with_retry(config=RetryConfig(max_attempts=3, base_delay=1.0))
     async def _execute_persisted_query(
         self,
         operation_name: str,
         variables: dict[str, Any],
+        *,
+        _self_heal_attempted: bool = False,
     ) -> dict[str, Any]:
         """Execute a persisted GraphQL query.
 
@@ -315,6 +487,14 @@ class HEBGraphQLClient:
                         return cast(dict[str, Any], payload_data)
                 return {}
 
+            except PersistedQueryNotFoundError:
+                if _self_heal_attempted:
+                    raise
+                if not await self._try_self_heal(operation_name):
+                    raise
+                return await self._execute_persisted_query(
+                    operation_name, variables, _self_heal_attempted=True
+                )
             except (httpx.HTTPError, GraphQLError) as e:
                 self.circuit_breaker.record_failure()
                 logger.error(
@@ -431,10 +611,12 @@ class HEBGraphQLClient:
         for query in query_variations:
             try:
                 result_stores = await self._execute_store_search(query, radius_miles)
-                attempts.append(SearchAttempt(
-                    query=query,
-                    result="success" if result_stores else "no_stores",
-                ))
+                attempts.append(
+                    SearchAttempt(
+                        query=query,
+                        result="success" if result_stores else "no_stores",
+                    )
+                )
 
                 if result_stores:
                     stores = result_stores
@@ -466,11 +648,7 @@ class HEBGraphQLClient:
                     )
             # Sort by calculated distance
             stores.sort(
-                key=lambda s: (
-                    s.distance_miles
-                    if s.distance_miles is not None
-                    else float("inf")
-                )
+                key=lambda s: s.distance_miles if s.distance_miles is not None else float("inf")
             )
 
         # Step 5: Build response with feedback
@@ -486,9 +664,7 @@ class HEBGraphQLClient:
                 ]
             else:
                 location = geocoded.display_name if geocoded else address
-                error = (
-                    f"No HEB stores found within {radius_miles} miles of {location}."
-                )
+                error = f"No HEB stores found within {radius_miles} miles of {location}."
                 suggestions = [
                     "HEB operates primarily in Texas",
                     "Try increasing the search radius",
@@ -597,24 +773,20 @@ class HEBGraphQLClient:
         if store_fulfillments is not None:
             # Build list of fulfillment channel names
             fulfillment_names = [
-                f.get("name", "")
-                for f in store_fulfillments
-                if isinstance(f, dict)
+                f.get("name", "") for f in store_fulfillments if isinstance(f, dict)
             ]
             # Curbside = any fulfillment containing "CURBSIDE" (CURBSIDE_PICKUP, CURBSIDE_DELIVERY)
             supports_curbside = any("CURBSIDE" in name for name in fulfillment_names)
             # Delivery = ALCOHOL_DELIVERY or DELIVERY channel
             supports_delivery = any(
-                "DELIVERY" in name and "CURBSIDE" not in name
-                for name in fulfillment_names
+                "DELIVERY" in name and "CURBSIDE" not in name for name in fulfillment_names
             )
         else:
             # Legacy format: check fulfillmentChannels array of strings
             fulfillment_channels = store_data.get("fulfillmentChannels", None)
             if fulfillment_channels is not None:
                 supports_curbside = (
-                    "PICKUP" in fulfillment_channels
-                    or "CURBSIDE" in fulfillment_channels
+                    "PICKUP" in fulfillment_channels or "CURBSIDE" in fulfillment_channels
                 )
                 supports_delivery = "DELIVERY" in fulfillment_channels
             else:
@@ -713,13 +885,24 @@ class HEBGraphQLClient:
                 break
 
         # Add "Meal Simple" prefix for meal-related queries
-        meal_keywords = ["steak", "chicken", "salmon", "pork", "beef", "shrimp",
-                         "asparagus", "potato", "meatloaf", "alfredo", "enchilada",
-                         "jambalaya", "bowl", "dinner", "entree"]
-        if (
-            any(kw in query_lower for kw in meal_keywords)
-            and "meal simple" not in query_lower
-        ):
+        meal_keywords = [
+            "steak",
+            "chicken",
+            "salmon",
+            "pork",
+            "beef",
+            "shrimp",
+            "asparagus",
+            "potato",
+            "meatloaf",
+            "alfredo",
+            "enchilada",
+            "jambalaya",
+            "bowl",
+            "dinner",
+            "entree",
+        ]
+        if any(kw in query_lower for kw in meal_keywords) and "meal simple" not in query_lower:
             variations.append(f"Meal Simple {query}")
 
         # Add "H-E-B" prefix if not present
@@ -915,11 +1098,13 @@ class HEBGraphQLClient:
 
                     if was_challenge:
                         security_challenge_detected = True
-                        attempts.append(ProductSearchAttempt(
-                            query=variation,
-                            method="ssr",
-                            result="security_challenge",
-                        ))
+                        attempts.append(
+                            ProductSearchAttempt(
+                                query=variation,
+                                method="ssr",
+                                result="security_challenge",
+                            )
+                        )
                         logger.error(
                             (
                                 "Security challenge detected - stopping search attempts, "
@@ -931,11 +1116,13 @@ class HEBGraphQLClient:
                         break
 
                     if products:
-                        attempts.append(ProductSearchAttempt(
-                            query=variation,
-                            method="ssr",
-                            result="success",
-                        ))
+                        attempts.append(
+                            ProductSearchAttempt(
+                                query=variation,
+                                method="ssr",
+                                result="success",
+                            )
+                        )
                         logger.info(
                             "SSR search successful",
                             original_query=query,
@@ -953,19 +1140,23 @@ class HEBGraphQLClient:
                             search_url=search_url,
                         )
                     else:
-                        attempts.append(ProductSearchAttempt(
-                            query=variation,
-                            method="ssr",
-                            result="empty",
-                        ))
+                        attempts.append(
+                            ProductSearchAttempt(
+                                query=variation,
+                                method="ssr",
+                                result="empty",
+                            )
+                        )
 
                 except Exception as e:
-                    attempts.append(ProductSearchAttempt(
-                        query=variation,
-                        method="ssr",
-                        result="error",
-                        error_detail=str(e),
-                    ))
+                    attempts.append(
+                        ProductSearchAttempt(
+                            query=variation,
+                            method="ssr",
+                            result="error",
+                            error_detail=str(e),
+                        )
+                    )
                     logger.warning(
                         "Authenticated search failed for variation",
                         query=variation,
@@ -987,20 +1178,24 @@ class HEBGraphQLClient:
 
                                 if was_challenge:
                                     security_challenge_detected = True
-                                    attempts.append(ProductSearchAttempt(
-                                        query=suggestion,
-                                        method="typeahead_as_ssr",
-                                        result="security_challenge",
-                                    ))
+                                    attempts.append(
+                                        ProductSearchAttempt(
+                                            query=suggestion,
+                                            method="typeahead_as_ssr",
+                                            result="security_challenge",
+                                        )
+                                    )
                                     # Fail-fast: don't try more suggestions
                                     break
 
                                 if products:
-                                    attempts.append(ProductSearchAttempt(
-                                        query=suggestion,
-                                        method="typeahead_as_ssr",
-                                        result="success",
-                                    ))
+                                    attempts.append(
+                                        ProductSearchAttempt(
+                                            query=suggestion,
+                                            method="typeahead_as_ssr",
+                                            result="success",
+                                        )
+                                    )
                                     logger.info(
                                         "SSR search successful via typeahead suggestion",
                                         original_query=query,
@@ -1018,19 +1213,23 @@ class HEBGraphQLClient:
                                         search_url=search_url,
                                     )
                                 else:
-                                    attempts.append(ProductSearchAttempt(
-                                        query=suggestion,
-                                        method="typeahead_as_ssr",
-                                        result="empty",
-                                    ))
+                                    attempts.append(
+                                        ProductSearchAttempt(
+                                            query=suggestion,
+                                            method="typeahead_as_ssr",
+                                            result="empty",
+                                        )
+                                    )
 
                             except Exception as e:
-                                attempts.append(ProductSearchAttempt(
-                                    query=suggestion,
-                                    method="typeahead_as_ssr",
-                                    result="error",
-                                    error_detail=str(e),
-                                ))
+                                attempts.append(
+                                    ProductSearchAttempt(
+                                        query=suggestion,
+                                        method="typeahead_as_ssr",
+                                        result="error",
+                                        error_detail=str(e),
+                                    )
+                                )
                                 continue
                 except Exception as e:
                     logger.debug("Typeahead-guided search failed", error=str(e))
@@ -1091,11 +1290,13 @@ class HEBGraphQLClient:
                 original_price=None,
             )
             products.append(product)
-            attempts.append(ProductSearchAttempt(
-                query=suggestion,
-                method="typeahead",
-                result="success",
-            ))
+            attempts.append(
+                ProductSearchAttempt(
+                    query=suggestion,
+                    method="typeahead",
+                    result="success",
+                )
+            )
 
         return ProductSearchResult(
             products=products,
@@ -1225,11 +1426,9 @@ class HEBGraphQLClient:
                 response.raise_for_status()
 
                 # Check for security challenge
-                if response.headers.get(
-                    "content-type", ""
-                ).startswith("text/html") and self._detect_security_challenge(
-                    response.text
-                ):
+                if response.headers.get("content-type", "").startswith(
+                    "text/html"
+                ) and self._detect_security_challenge(response.text):
                     logger.warning(
                         "Security challenge detected in product details response",
                         product_id=product_id,
@@ -1247,9 +1446,7 @@ class HEBGraphQLClient:
 
                 if not product_data:
                     page_props_keys = (
-                        list(data.get("pageProps", {}).keys())
-                        if "pageProps" in data
-                        else None
+                        list(data.get("pageProps", {}).keys()) if "pageProps" in data else None
                     )
                     logger.warning(
                         "No product data in response",
@@ -1461,13 +1658,15 @@ class HEBGraphQLClient:
             if n.get("subItems"):
                 sub_items = self._parse_nutrients(n["subItems"])
 
-            result.append(NutrientInfo(
-                title=n.get("title", ""),
-                unit=n.get("unit", ""),
-                percentage=n.get("percentage"),
-                font_modifier=n.get("fontModifier"),
-                sub_items=sub_items,
-            ))
+            result.append(
+                NutrientInfo(
+                    title=n.get("title", ""),
+                    unit=n.get("unit", ""),
+                    percentage=n.get("percentage"),
+                    font_modifier=n.get("fontModifier"),
+                    sub_items=sub_items,
+                )
+            )
         return result
 
     @with_retry(config=RetryConfig(max_attempts=2, base_delay=0.5))
@@ -1797,6 +1996,8 @@ class HEBGraphQLClient:
         client: httpx.AsyncClient,
         operation_name: str,
         variables: dict[str, Any],
+        *,
+        _self_heal_attempted: bool = False,
     ) -> dict[str, Any]:
         """Execute a persisted GraphQL query with a specific client.
 
@@ -1850,6 +2051,14 @@ class HEBGraphQLClient:
                     return cast(dict[str, Any], payload_data)
             return {}
 
+        except PersistedQueryNotFoundError:
+            if _self_heal_attempted:
+                raise
+            if not await self._try_self_heal(operation_name):
+                raise
+            return await self._execute_persisted_query_with_client(
+                client, operation_name, variables, _self_heal_attempted=True
+            )
         except (httpx.HTTPError, GraphQLError) as e:
             self.circuit_breaker.record_failure()
             logger.error(
@@ -2020,11 +2229,13 @@ class HEBGraphQLClient:
 
         for cat in product_categories:
             try:
-                categories.append(CouponCategory(
-                    id=cat.get("option", 0),
-                    name=cat.get("displayName", ""),
-                    count=cat.get("count", 0),
-                ))
+                categories.append(
+                    CouponCategory(
+                        id=cat.get("option", 0),
+                        name=cat.get("displayName", ""),
+                        count=cat.get("count", 0),
+                    )
+                )
             except Exception:
                 continue
 
@@ -2055,6 +2266,7 @@ class HEBGraphQLClient:
             # Convert YYYY-MM-DD to more readable format
             try:
                 from datetime import datetime
+
                 dt = datetime.strptime(exp_date, "%Y-%m-%d")
                 expires_display = dt.strftime("%m/%d/%Y")
             except Exception:
@@ -2181,9 +2393,7 @@ class HEBGraphQLClient:
                 categories=[],
             )
 
-    async def select_store(
-        self, store_id: str, ignore_conflicts: bool = False
-    ) -> dict[str, Any]:
+    async def select_store(self, store_id: str, ignore_conflicts: bool = False) -> dict[str, Any]:
         """Change the active store via GraphQL mutation with verification.
 
         This calls the SelectPickupFulfillment mutation which changes
