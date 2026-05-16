@@ -387,9 +387,60 @@ class HEBGraphQLClient:
             "persisted-query hash stale; attempting rediscovery",
             operation=operation_name,
         )
+        # Mutations (cartItemV2, SelectPickupFulfillment, CouponClip)
+        # don't fire on passive page load. If the rotated op has a
+        # registered active flow, drive that under Playwright first —
+        # bypass the page-load sweep which would just fail silently.
         try:
-            from texas_grocery_mcp.clients.hash_rediscover import rediscover_hashes
+            from texas_grocery_mcp.clients.hash_rediscover import (
+                MUTATION_FLOWS,
+                discover_mutation_hash,
+                rediscover_hashes,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "hash rediscover import failed",
+                operation=operation_name,
+                error=str(e),
+            )
+            return False
 
+        if operation_name in MUTATION_FLOWS:
+            try:
+                sha = await discover_mutation_hash(
+                    operation_name,
+                    auth_state_path=settings.auth_state_path,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    "active mutation-hash discovery failed",
+                    operation=operation_name,
+                    error=str(e),
+                )
+                return False
+            if not sha:
+                logger.warning(
+                    "active mutation-hash discovery captured nothing",
+                    operation=operation_name,
+                )
+                return False
+            changed = await PERSISTED_QUERIES.rotate({operation_name: sha})
+            if operation_name in changed:
+                logger.info(
+                    "persisted-query mutation hash rotated; retrying request",
+                    operation=operation_name,
+                    new_hash=changed[operation_name],
+                )
+                return True
+            logger.warning(
+                "active discovery returned a hash but rotate didn't change it",
+                operation=operation_name,
+                captured=sha,
+            )
+            return False
+
+        # Non-mutation: passive page-load sweep.
+        try:
             new_hashes = await rediscover_hashes(
                 auth_state_path=settings.auth_state_path,
                 target_operation=operation_name,

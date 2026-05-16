@@ -39,7 +39,11 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 if TYPE_CHECKING:
-    from playwright.async_api import Request
+    from collections.abc import Awaitable, Callable
+
+    from playwright.async_api import Page, Request
+
+    MutationFlow = Callable[[Page], Awaitable[None]]
 
 logger = structlog.get_logger()
 
@@ -195,3 +199,156 @@ def _record(body: Any, into: dict[str, str]) -> None:
     sha = persisted.get("sha256Hash")
     if isinstance(op, str) and isinstance(sha, str) and op and sha and op not in into:
         into[op] = sha
+
+
+# ---------------------------------------------------------------------------
+# Active mutation-hash discovery
+#
+# Page-load discovery (above) can't capture mutations — they only fire
+# on user clicks. For each tracked mutation we know how to simulate the
+# minimum click sequence in Playwright that triggers it; the network
+# handler then snags the persisted-query hash off the request body.
+#
+# Per-flow design notes:
+# - Flows MUST be state-preserving. Pick a click sequence whose server-
+#   side effect is a no-op (e.g. re-selecting the current store, or
+#   clip-then-unclip on a coupon). The popup's first store is the
+#   user's current store, verified 2026-05-16.
+# - If HEB changes the UI selector, the flow breaks. Same risk class as
+#   OPERATION_PAGES — independent failure mode per flow.
+# - Flows are async functions that take a `Page` (already navigated /
+#   logged in via the shared auth.json) and do whatever clicks they
+#   need. The driver attaches the network capture before calling.
+# ---------------------------------------------------------------------------
+
+
+DEFAULT_MUTATION_TIMEOUT_S = 45.0
+
+
+async def _flow_select_pickup_fulfillment(page: Any) -> None:
+    """Trigger SelectPickupFulfillment by re-selecting the current store.
+
+    The popup defaults the user's current store to position 1. Clicking
+    the first `selectStoreButton` fires the mutation with no net
+    server-side change (the user ends up where they started).
+
+    Selectors verified 2026-05-16: header `data-testid="header_change_store"`
+    opens the store popup; the popup's first `data-qe-id="selectStoreButton"`
+    is the current store row.
+    """
+    await page.goto("https://www.heb.com/", wait_until="domcontentloaded")
+    header = page.locator('[data-testid="header_change_store"]').first
+    await header.wait_for(state="visible", timeout=15_000)
+    await header.click()
+    button = page.locator('[data-qe-id="selectStoreButton"]').first
+    await button.wait_for(state="visible", timeout=15_000)
+    await button.click()
+
+
+# Operation name -> click-flow that triggers it. New mutations: add a
+# flow function above and an entry here. NOTHING in OPERATION_PAGES.
+MUTATION_FLOWS: dict[str, MutationFlow] = {
+    "SelectPickupFulfillment": _flow_select_pickup_fulfillment,
+}
+
+
+async def discover_mutation_hash(
+    operation_name: str,
+    *,
+    auth_state_path: Path | None = None,
+    timeout_s: float = DEFAULT_MUTATION_TIMEOUT_S,
+) -> str | None:
+    """Drive a logged-in browser through the registered flow for ``operation_name``,
+    capture the persisted-query hash from the resulting GraphQL request.
+
+    Returns the captured sha256 hash, or ``None`` if the flow fired no
+    matching request within ``timeout_s``. Raises if the operation has
+    no registered flow OR Playwright isn't installed (callers should
+    fall back to the passive sweep on those errors).
+
+    Used by ``_try_self_heal`` as the mutation-aware alternative to
+    ``rediscover_hashes`` (which is page-load-only and can't capture
+    mutations).
+    """
+    flow = MUTATION_FLOWS.get(operation_name)
+    if flow is None:
+        raise KeyError(
+            f"no MUTATION_FLOWS entry for {operation_name!r}; "
+            f"registered: {sorted(MUTATION_FLOWS)}"
+        )
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "discover_mutation_hash requires Playwright. "
+            "Install with `pip install texas-grocery-mcp[browser]`."
+        ) from exc
+
+    captured: list[str] = []
+
+    def _on_request(request: Any) -> None:
+        try:
+            if "graphql" not in request.url.lower():
+                return
+            raw = request.post_data
+            if not raw:
+                return
+            try:
+                body: Any = json.loads(raw)
+            except json.JSONDecodeError:
+                return
+            entries = body if isinstance(body, list) else [body]
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("operationName") != operation_name:
+                    continue
+                ext = entry.get("extensions") or {}
+                persisted = ext.get("persistedQuery") or {}
+                sha = persisted.get("sha256Hash")
+                if isinstance(sha, str) and sha:
+                    captured.append(sha)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("discover_mutation: capture handler error", error=str(e))
+
+    async def _run() -> None:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                context_kwargs: dict[str, Any] = {}
+                if auth_state_path and Path(auth_state_path).exists():
+                    context_kwargs["storage_state"] = str(auth_state_path)
+                context = await browser.new_context(**context_kwargs)
+                page = await context.new_page()
+                page.on("request", _on_request)
+                await flow(page)
+                # Give the request a moment to actually fire after the click.
+                await page.wait_for_timeout(2_000)
+            finally:
+                await browser.close()
+
+    try:
+        await asyncio.wait_for(_run(), timeout=timeout_s)
+    except TimeoutError:
+        logger.warning(
+            "discover_mutation: overall timeout",
+            operation=operation_name,
+            captured_so_far=len(captured),
+        )
+
+    if not captured:
+        logger.warning(
+            "discover_mutation: flow fired no matching request",
+            operation=operation_name,
+        )
+        return None
+    # Last-write-wins (some flows might fire the mutation multiple
+    # times — same hash either way).
+    sha = captured[-1]
+    logger.info(
+        "discover_mutation: captured hash",
+        operation=operation_name,
+        sha256=sha,
+        fire_count=len(captured),
+    )
+    return sha

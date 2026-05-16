@@ -57,3 +57,39 @@ def test_broadcast_covers_common_ops():
             f"{op}'s pages {op_urls} aren't in DEFAULT_DISCOVERY_URLS — "
             "broadcast fallback won't catch a rotation"
         )
+
+
+def test_mutation_flows_registry_keys_have_no_operation_pages_entry():
+    """A mutation registered for active discovery MUST NOT also be in
+    OPERATION_PAGES. The two registries are mutually exclusive — passive
+    page-load can't capture mutations; if it could, we wouldn't need
+    the click flow. Having both leads to silent failure.
+    """
+    from texas_grocery_mcp.clients.hash_rediscover import MUTATION_FLOWS
+
+    for op in MUTATION_FLOWS:
+        assert op not in OPERATION_PAGES, (
+            f"{op} is in MUTATION_FLOWS — it must NOT also be in "
+            "OPERATION_PAGES. Choose one discovery path per operation."
+        )
+
+
+def test_mutation_flows_contains_select_pickup_fulfillment():
+    """SelectPickupFulfillment is the load-bearing mutation: store_change,
+    cart_add, cart_remove all need its hash. Confirm we ship an active
+    flow for it."""
+    from texas_grocery_mcp.clients.hash_rediscover import MUTATION_FLOWS
+
+    assert "SelectPickupFulfillment" in MUTATION_FLOWS
+    flow = MUTATION_FLOWS["SelectPickupFulfillment"]
+    assert callable(flow)
+
+
+async def test_discover_mutation_hash_unknown_op_raises():
+    """Unknown operation_name is a programming error, not silent return."""
+    import pytest
+
+    from texas_grocery_mcp.clients.hash_rediscover import discover_mutation_hash
+
+    with pytest.raises(KeyError, match="no MUTATION_FLOWS entry"):
+        await discover_mutation_hash("UnregisteredOperation")
