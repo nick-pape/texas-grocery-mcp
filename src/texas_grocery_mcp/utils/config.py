@@ -33,6 +33,20 @@ class Settings(BaseSettings):
         description="Path to Playwright auth state file",
     )
 
+    # GraphQL persisted-query hash self-heal. When HEB rotates a hash,
+    # the request fails with "PersistedQueryNotFound"; the client can
+    # rediscover the new hash via Playwright and retry once. Overrides
+    # are persisted across spawns so subsequent cold starts skip discovery.
+    hash_overrides_path: Path | None = Field(
+        default=None,
+        description="JSON file storing rotated GraphQL hashes; defaults to "
+        "<auth_state_path's parent>/hash_overrides.json.",
+    )
+    hash_self_heal_enabled: bool = Field(
+        default=True,
+        description="Enable in-process rediscovery + retry on stale persisted-query hashes.",
+    )
+
     # Redis Configuration
     redis_url: str | None = Field(
         default=None,

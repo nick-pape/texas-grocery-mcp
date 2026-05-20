@@ -4,8 +4,10 @@ Supports both unauthenticated (typeahead) and authenticated (full product search
 modes. Authenticated mode uses browser session cookies for faster API access.
 """
 
+import asyncio
 import json
 import re
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -55,9 +57,11 @@ class PersistedQueryNotFoundError(Exception):
     pass
 
 
-# Persisted Query Hashes (discovered via reverse engineering)
-# These may change when HEB deploys new code
-PERSISTED_QUERIES = {
+# Persisted Query Hashes (discovered via reverse engineering).
+# HEB rotates these when their frontend ships new code; the HashStore
+# below tracks rotations at runtime and persists overrides so we don't
+# need a code release every time.
+DEFAULT_PERSISTED_QUERIES = {
     "ShopNavigation": "0e669423cef683226cb8eb295664619c8e0f95945734e0a458095f51ee89efb3",
     "alertEntryPoint": "3e3ccd248652e8fce4674d0c5f3f30f2ddc63da277bfa0ff36ea9420e5dffd5e",
     "cartEstimated": "7b033abaf2caa80bc49541e51d2b89e3cc6a316e37c4bd576d9b5c498a51e9c5",
@@ -68,6 +72,118 @@ PERSISTED_QUERIES = {
     # Store change mutation - changes the active pickup store
     "SelectPickupFulfillment": "8fa3c683ee37ad1bab9ce22b99bd34315b2a89cfc56208d63ba9efc0c49a6323",
 }
+
+
+class HashStore:
+    """Mutable registry of persisted-query hashes with on-disk override cache.
+
+    Behaves like a read-only dict for callers (`store[op]`, `op in store`).
+    When HEB rotates a hash, ``rotate()`` updates the in-memory entry and
+    writes the override to ``cache_path`` — so the next process spawn loads
+    the rotated hash directly without going through rediscovery again.
+
+    The cache file stores ONLY entries that diverge from defaults. That
+    keeps the file small and makes it obvious which hashes have rotated.
+    """
+
+    def __init__(
+        self,
+        defaults: dict[str, str],
+        cache_path: Path | None = None,
+    ) -> None:
+        self._defaults = dict(defaults)
+        self._cache_path = cache_path
+        self._lock = asyncio.Lock()
+        self._effective: dict[str, str] = {**self._defaults, **self._load_overrides()}
+
+    def _load_overrides(self) -> dict[str, str]:
+        if not self._cache_path or not self._cache_path.exists():
+            return {}
+        try:
+            data = json.loads(self._cache_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                "hash overrides cache unreadable; starting fresh",
+                path=str(self._cache_path),
+                error=str(e),
+            )
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+
+    def __contains__(self, op: object) -> bool:
+        return op in self._effective
+
+    def __getitem__(self, op: str) -> str:
+        return self._effective[op]
+
+    def __iter__(self):
+        return iter(self._effective)
+
+    def __len__(self) -> int:
+        return len(self._effective)
+
+    def get(self, op: str, default: str | None = None) -> str | None:
+        return self._effective.get(op, default)
+
+    def items(self):
+        return self._effective.items()
+
+    def keys(self):
+        return self._effective.keys()
+
+    @property
+    def overrides(self) -> dict[str, str]:
+        """Entries that diverge from defaults (i.e., rotations we've recorded)."""
+        return {k: v for k, v in self._effective.items() if v != self._defaults.get(k)}
+
+    async def rotate(self, new: dict[str, str]) -> dict[str, str]:
+        """Apply discovered hashes; persist overrides; return changed entries.
+
+        Empty/falsy values are ignored. Unknown operation names are accepted
+        (HEB might add ones we don't track yet) but won't help us until a
+        call site references them — they're stored anyway as future-proofing.
+        """
+        async with self._lock:
+            changed: dict[str, str] = {}
+            for op, val in new.items():
+                if not val:
+                    continue
+                if self._effective.get(op) != val:
+                    self._effective[op] = val
+                    changed[op] = val
+            if changed and self._cache_path is not None:
+                try:
+                    self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._cache_path.write_text(
+                        json.dumps(self.overrides, indent=2, sort_keys=True)
+                    )
+                except OSError as e:
+                    logger.error(
+                        "failed to persist hash overrides",
+                        path=str(self._cache_path),
+                        error=str(e),
+                    )
+            return changed
+
+
+def _default_overrides_path() -> Path:
+    """Default cache path: sibling of auth.json so per-identity volume mounts catch it."""
+    settings = get_settings()
+    override = settings.hash_overrides_path
+    if override is not None:
+        return override
+    return settings.auth_state_path.parent / "hash_overrides.json"
+
+
+# Module-level HashStore — the existing call sites use `PERSISTED_QUERIES[op]`
+# and `op in PERSISTED_QUERIES`, both of which the HashStore implements. So
+# replacing the dict literal with a HashStore is a drop-in change.
+PERSISTED_QUERIES = HashStore(
+    defaults=DEFAULT_PERSISTED_QUERIES,
+    cache_path=_default_overrides_path(),
+)
 
 # Well-known HEB stores (fallback for store search)
 KNOWN_STORES = {
@@ -252,11 +368,119 @@ class HEBGraphQLClient:
         )
         raise RuntimeError("Could not extract Next.js build ID from HEB homepage")
 
+    async def _try_self_heal(self, operation_name: str) -> bool:
+        """Rediscover hashes for HEB and rotate the store; return True if a
+        new hash for ``operation_name`` was applied.
+
+        On True, the caller should retry the in-flight request once. On
+        False, the caller should re-raise the original
+        ``PersistedQueryNotFoundError`` — either rediscovery is disabled,
+        the rediscovery sweep failed, or the rediscovery did not observe
+        the rotated operation (e.g., it's a mutation that only fires on
+        an interaction we don't simulate). Self-heal is opt-out via
+        ``settings.hash_self_heal_enabled``.
+        """
+        settings = get_settings()
+        if not settings.hash_self_heal_enabled:
+            return False
+        logger.info(
+            "persisted-query hash stale; attempting rediscovery",
+            operation=operation_name,
+        )
+        # Mutations (cartItemV2, SelectPickupFulfillment, CouponClip)
+        # don't fire on passive page load. If the rotated op has a
+        # registered active flow, drive that under Playwright first —
+        # bypass the page-load sweep which would just fail silently.
+        try:
+            from texas_grocery_mcp.clients.hash_rediscover import (
+                MUTATION_FLOWS,
+                discover_mutation_hash,
+                rediscover_hashes,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "hash rediscover import failed",
+                operation=operation_name,
+                error=str(e),
+            )
+            return False
+
+        if operation_name in MUTATION_FLOWS:
+            try:
+                sha = await discover_mutation_hash(
+                    operation_name,
+                    auth_state_path=settings.auth_state_path,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    "active mutation-hash discovery failed",
+                    operation=operation_name,
+                    error=str(e),
+                )
+                return False
+            if not sha:
+                logger.warning(
+                    "active mutation-hash discovery captured nothing",
+                    operation=operation_name,
+                )
+                return False
+            changed = await PERSISTED_QUERIES.rotate({operation_name: sha})
+            if operation_name in changed:
+                logger.info(
+                    "persisted-query mutation hash rotated; retrying request",
+                    operation=operation_name,
+                    new_hash=changed[operation_name],
+                )
+                return True
+            logger.warning(
+                "active discovery returned a hash but rotate didn't change it",
+                operation=operation_name,
+                captured=sha,
+            )
+            return False
+
+        # Non-mutation: passive page-load sweep.
+        try:
+            new_hashes = await rediscover_hashes(
+                auth_state_path=settings.auth_state_path,
+                target_operation=operation_name,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "hash rediscovery failed",
+                operation=operation_name,
+                error=str(e),
+            )
+            return False
+        if not new_hashes:
+            logger.warning(
+                "hash rediscovery returned no hashes",
+                operation=operation_name,
+            )
+            return False
+        changed = await PERSISTED_QUERIES.rotate(new_hashes)
+        if operation_name in changed:
+            logger.info(
+                "persisted-query hash rotated; retrying request",
+                operation=operation_name,
+                new_hash=changed[operation_name],
+            )
+            return True
+        logger.warning(
+            "rediscovery did not observe the stale operation",
+            operation=operation_name,
+            captured=sorted(new_hashes),
+            rotated=sorted(changed),
+        )
+        return False
+
     @with_retry(config=RetryConfig(max_attempts=3, base_delay=1.0))
     async def _execute_persisted_query(
         self,
         operation_name: str,
         variables: dict[str, Any],
+        *,
+        _self_heal_attempted: bool = False,
     ) -> dict[str, Any]:
         """Execute a persisted GraphQL query.
 
@@ -315,6 +539,14 @@ class HEBGraphQLClient:
                         return cast(dict[str, Any], payload_data)
                 return {}
 
+            except PersistedQueryNotFoundError:
+                if _self_heal_attempted:
+                    raise
+                if not await self._try_self_heal(operation_name):
+                    raise
+                return await self._execute_persisted_query(
+                    operation_name, variables, _self_heal_attempted=True
+                )
             except (httpx.HTTPError, GraphQLError) as e:
                 self.circuit_breaker.record_failure()
                 logger.error(
@@ -1797,6 +2029,8 @@ class HEBGraphQLClient:
         client: httpx.AsyncClient,
         operation_name: str,
         variables: dict[str, Any],
+        *,
+        _self_heal_attempted: bool = False,
     ) -> dict[str, Any]:
         """Execute a persisted GraphQL query with a specific client.
 
@@ -1850,6 +2084,14 @@ class HEBGraphQLClient:
                     return cast(dict[str, Any], payload_data)
             return {}
 
+        except PersistedQueryNotFoundError:
+            if _self_heal_attempted:
+                raise
+            if not await self._try_self_heal(operation_name):
+                raise
+            return await self._execute_persisted_query_with_client(
+                client, operation_name, variables, _self_heal_attempted=True
+            )
         except (httpx.HTTPError, GraphQLError) as e:
             self.circuit_breaker.record_failure()
             logger.error(

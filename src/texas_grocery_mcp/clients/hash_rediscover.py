@@ -1,0 +1,354 @@
+"""Auto-rediscovery of HEB GraphQL persisted-query hashes.
+
+When HEB rotates a hash, ``_execute_persisted_query`` raises
+``PersistedQueryNotFoundError``. The client catches it, calls
+``rediscover_hashes()`` here, and retries the original request once
+with the freshly-discovered hash.
+
+The discovery flow:
+
+1. Launch headless Chromium with the existing Playwright auth state
+   (``auth_state_path`` — same auth.json the rest of the MCP uses).
+2. Attach a request interceptor that filters for graphql POSTs and
+   captures ``operationName`` + ``extensions.persistedQuery.sha256Hash``
+   from the request body.
+3. Navigate a predefined set of HEB pages whose page-load JavaScript
+   issues each tracked operation. Capture as many hashes as fall out.
+4. Return the discovered ``op -> hash`` mapping. Caller feeds it to
+   ``HashStore.rotate()``.
+
+Notes:
+- Mutation operations (e.g., ``CouponClip``, ``SelectPickupFulfillment``)
+  don't fire on page load — they need an active interaction. This sweep
+  is best-effort: the caller may receive a partial dict if the rotated
+  op only fires on a button click. For those, the next call site that
+  hits the stale hash will trigger another rediscovery; if THAT one
+  also can't see the op, manual hash refresh is the escape hatch.
+- This module imports ``playwright.async_api`` lazily so projects that
+  install texas-grocery-mcp without the ``[browser]`` extra still work
+  (they just lose self-heal on hash rotation).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import structlog
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from playwright.async_api import Page, Request
+
+    MutationFlow = Callable[[Page], Awaitable[None]]
+
+logger = structlog.get_logger()
+
+
+# Pages whose first paint triggers each tracked GraphQL operation.
+# Map operation_name -> tuple of URLs whose page-load JS fires that op.
+# When the client knows which op rotated, we visit ONLY the relevant
+# page(s) — typically one — instead of broadcasting the full sweep.
+# Other ops that happen to fire on the same page get captured for free.
+#
+# Mutations that only fire on user clicks (cartItemV2,
+# SelectPickupFulfillment, CouponClip) intentionally have no entry here
+# — passive page-load can't trigger them. For those, the broadcast
+# fallback runs but won't recover the hash; manual override is the
+# escape hatch.
+OPERATION_PAGES: dict[str, tuple[str, ...]] = {
+    "ShopNavigation": ("https://www.heb.com/",),
+    "alertEntryPoint": ("https://www.heb.com/",),
+    "cartEstimated": ("https://www.heb.com/cart",),
+    "typeaheadContent": ("https://www.heb.com/search?q=milk",),
+    "StoreSearch": ("https://www.heb.com/store-locations",),
+    # Non-default ops we've observed firing on these pages:
+    "entryPoint": ("https://www.heb.com/",),
+    "getFrequentlyPurchasedProducts": ("https://www.heb.com/cart",),
+    "historicCashbackEstimate": ("https://www.heb.com/cart",),
+    "shoppingListCarouselV2": ("https://www.heb.com/",),
+}
+
+# Used when no target_operation is given (or its op isn't in
+# OPERATION_PAGES). Visit a small spread that exercises common ops.
+DEFAULT_DISCOVERY_URLS: tuple[str, ...] = (
+    "https://www.heb.com/",
+    "https://www.heb.com/cart",
+    "https://www.heb.com/search?q=milk",
+    "https://www.heb.com/category/all-coupons/490005",
+)
+
+DEFAULT_PAGE_TIMEOUT_MS = 20_000
+DEFAULT_OVERALL_TIMEOUT_S = 60.0
+
+
+async def rediscover_hashes(
+    *,
+    auth_state_path: Path | None = None,
+    target_operation: str | None = None,
+    urls: tuple[str, ...] | None = None,
+    page_timeout_ms: int = DEFAULT_PAGE_TIMEOUT_MS,
+    overall_timeout_s: float = DEFAULT_OVERALL_TIMEOUT_S,
+) -> dict[str, str]:
+    """Sweep HEB pages, capture persisted-query hashes from outgoing GraphQL.
+
+    When ``target_operation`` is given and known to ``OPERATION_PAGES``,
+    only the pages associated with that op are visited — typically one
+    page, ~5-10s instead of the full ~30-60s broadcast. Any *other* ops
+    that happen to fire on the same page are captured opportunistically.
+
+    When ``target_operation`` is None or unknown, falls back to
+    ``DEFAULT_DISCOVERY_URLS`` (broadcast).
+
+    ``urls`` overrides both selection paths (used for tests/debugging).
+
+    Returns a dict of ``operationName -> sha256Hash`` for every operation
+    observed. May be partial if the rotated op doesn't fire passively
+    (mutations need an interactive flow we don't simulate here).
+    """
+    if urls is None:
+        if target_operation and target_operation in OPERATION_PAGES:
+            urls = OPERATION_PAGES[target_operation]
+        else:
+            urls = DEFAULT_DISCOVERY_URLS
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "rediscover_hashes requires Playwright. "
+            "Install with `pip install texas-grocery-mcp[browser]`."
+        ) from exc
+
+    discovered: dict[str, str] = {}
+
+    def _capture(request: Request) -> None:
+        try:
+            url = request.url
+            if "graphql" not in url.lower():
+                return
+            raw = request.post_data
+            if not raw:
+                return
+            try:
+                body: Any = json.loads(raw)
+            except json.JSONDecodeError:
+                return
+            if isinstance(body, list):
+                # Apollo batched payload — walk each entry.
+                for entry in body:
+                    _record(entry, discovered)
+            else:
+                _record(body, discovered)
+        except Exception as e:  # noqa: BLE001 — defensive; never crash the page
+            logger.debug("rediscover: capture handler error", error=str(e))
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            context_kwargs: dict[str, Any] = {}
+            if auth_state_path and Path(auth_state_path).exists():
+                context_kwargs["storage_state"] = str(auth_state_path)
+            context = await browser.new_context(**context_kwargs)
+            page = await context.new_page()
+            page.on("request", _capture)
+
+            async def _visit_all() -> None:
+                for url in urls:
+                    try:
+                        await page.goto(
+                            url,
+                            wait_until="networkidle",
+                            timeout=page_timeout_ms,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        # Per-page failures are tolerated — we still get
+                        # partial results from other pages.
+                        logger.warning(
+                            "rediscover: navigation failed",
+                            url=url,
+                            error=str(e),
+                        )
+
+            try:
+                await asyncio.wait_for(_visit_all(), timeout=overall_timeout_s)
+            except TimeoutError:
+                logger.warning(
+                    "rediscover: overall timeout reached, returning partial results",
+                    captured=sorted(discovered),
+                )
+        finally:
+            await browser.close()
+
+    logger.info(
+        "rediscover: captured persisted-query hashes",
+        count=len(discovered),
+        operations=sorted(discovered),
+    )
+    return discovered
+
+
+def _record(body: Any, into: dict[str, str]) -> None:
+    if not isinstance(body, dict):
+        return
+    op = body.get("operationName")
+    extensions = body.get("extensions") or {}
+    persisted = extensions.get("persistedQuery") or {}
+    sha = persisted.get("sha256Hash")
+    if isinstance(op, str) and isinstance(sha, str) and op and sha and op not in into:
+        into[op] = sha
+
+
+# ---------------------------------------------------------------------------
+# Active mutation-hash discovery
+#
+# Page-load discovery (above) can't capture mutations — they only fire
+# on user clicks. For each tracked mutation we know how to simulate the
+# minimum click sequence in Playwright that triggers it; the network
+# handler then snags the persisted-query hash off the request body.
+#
+# Per-flow design notes:
+# - Flows MUST be state-preserving. Pick a click sequence whose server-
+#   side effect is a no-op (e.g. re-selecting the current store, or
+#   clip-then-unclip on a coupon). The popup's first store is the
+#   user's current store, verified 2026-05-16.
+# - If HEB changes the UI selector, the flow breaks. Same risk class as
+#   OPERATION_PAGES — independent failure mode per flow.
+# - Flows are async functions that take a `Page` (already navigated /
+#   logged in via the shared auth.json) and do whatever clicks they
+#   need. The driver attaches the network capture before calling.
+# ---------------------------------------------------------------------------
+
+
+DEFAULT_MUTATION_TIMEOUT_S = 45.0
+
+
+async def _flow_select_pickup_fulfillment(page: Any) -> None:
+    """Trigger SelectPickupFulfillment by re-selecting the current store.
+
+    The popup defaults the user's current store to position 1. Clicking
+    the first `selectStoreButton` fires the mutation with no net
+    server-side change (the user ends up where they started).
+
+    Selectors verified 2026-05-16: header `data-testid="header_change_store"`
+    opens the store popup; the popup's first `data-qe-id="selectStoreButton"`
+    is the current store row.
+    """
+    await page.goto("https://www.heb.com/", wait_until="domcontentloaded")
+    header = page.locator('[data-testid="header_change_store"]').first
+    await header.wait_for(state="visible", timeout=15_000)
+    await header.click()
+    button = page.locator('[data-qe-id="selectStoreButton"]').first
+    await button.wait_for(state="visible", timeout=15_000)
+    await button.click()
+
+
+# Operation name -> click-flow that triggers it. New mutations: add a
+# flow function above and an entry here. NOTHING in OPERATION_PAGES.
+MUTATION_FLOWS: dict[str, MutationFlow] = {
+    "SelectPickupFulfillment": _flow_select_pickup_fulfillment,
+}
+
+
+async def discover_mutation_hash(
+    operation_name: str,
+    *,
+    auth_state_path: Path | None = None,
+    timeout_s: float = DEFAULT_MUTATION_TIMEOUT_S,
+) -> str | None:
+    """Drive a logged-in browser through the registered flow for ``operation_name``,
+    capture the persisted-query hash from the resulting GraphQL request.
+
+    Returns the captured sha256 hash, or ``None`` if the flow fired no
+    matching request within ``timeout_s``. Raises if the operation has
+    no registered flow OR Playwright isn't installed (callers should
+    fall back to the passive sweep on those errors).
+
+    Used by ``_try_self_heal`` as the mutation-aware alternative to
+    ``rediscover_hashes`` (which is page-load-only and can't capture
+    mutations).
+    """
+    flow = MUTATION_FLOWS.get(operation_name)
+    if flow is None:
+        raise KeyError(
+            f"no MUTATION_FLOWS entry for {operation_name!r}; "
+            f"registered: {sorted(MUTATION_FLOWS)}"
+        )
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "discover_mutation_hash requires Playwright. "
+            "Install with `pip install texas-grocery-mcp[browser]`."
+        ) from exc
+
+    captured: list[str] = []
+
+    def _on_request(request: Any) -> None:
+        try:
+            if "graphql" not in request.url.lower():
+                return
+            raw = request.post_data
+            if not raw:
+                return
+            try:
+                body: Any = json.loads(raw)
+            except json.JSONDecodeError:
+                return
+            entries = body if isinstance(body, list) else [body]
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("operationName") != operation_name:
+                    continue
+                ext = entry.get("extensions") or {}
+                persisted = ext.get("persistedQuery") or {}
+                sha = persisted.get("sha256Hash")
+                if isinstance(sha, str) and sha:
+                    captured.append(sha)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("discover_mutation: capture handler error", error=str(e))
+
+    async def _run() -> None:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                context_kwargs: dict[str, Any] = {}
+                if auth_state_path and Path(auth_state_path).exists():
+                    context_kwargs["storage_state"] = str(auth_state_path)
+                context = await browser.new_context(**context_kwargs)
+                page = await context.new_page()
+                page.on("request", _on_request)
+                await flow(page)
+                # Give the request a moment to actually fire after the click.
+                await page.wait_for_timeout(2_000)
+            finally:
+                await browser.close()
+
+    try:
+        await asyncio.wait_for(_run(), timeout=timeout_s)
+    except TimeoutError:
+        logger.warning(
+            "discover_mutation: overall timeout",
+            operation=operation_name,
+            captured_so_far=len(captured),
+        )
+
+    if not captured:
+        logger.warning(
+            "discover_mutation: flow fired no matching request",
+            operation=operation_name,
+        )
+        return None
+    # Last-write-wins (some flows might fire the mutation multiple
+    # times — same hash either way).
+    sha = captured[-1]
+    logger.info(
+        "discover_mutation: captured hash",
+        operation=operation_name,
+        sha256=sha,
+        fire_count=len(captured),
+    )
+    return sha
