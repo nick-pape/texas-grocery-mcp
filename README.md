@@ -1,6 +1,5 @@
 # 🛒 Texas Grocery MCP
 
-[![PyPI version](https://badge.fury.io/py/texas-grocery-mcp.svg)](https://pypi.org/project/texas-grocery-mcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/nick-pape/texas-grocery-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/nick-pape/texas-grocery-mcp/actions/workflows/ci.yml)
 
@@ -32,13 +31,15 @@
 ### Quick Start
 
 ```bash
-pip install texas-grocery-mcp
+pip install git+https://github.com/nick-pape/texas-grocery-mcp.git
 ```
+
+> This fork installs from git (it is not on PyPI). The `texas-grocery-mcp` package on PyPI is the original, unmaintained project.
 
 ### Full Installation (Recommended) 🚀
 
 ```bash
-pip install texas-grocery-mcp[browser]
+pip install "texas-grocery-mcp[browser] @ git+https://github.com/nick-pape/texas-grocery-mcp.git"
 playwright install chromium
 ```
 
@@ -229,7 +230,7 @@ Agent uses: session_save_credentials(email="you@email.com", password="...")
 
 ```bash
 # Clone repository
-git clone https://github.com/mgwalkerjr95/texas-grocery-mcp
+git clone https://github.com/nick-pape/texas-grocery-mcp
 cd texas-grocery-mcp
 
 # Install with dev dependencies
