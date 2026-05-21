@@ -35,7 +35,7 @@ def _check_redis_health_sync(redis_url: str) -> ComponentHealth:
         import redis
 
         # Parse URL and connect with timeout
-        client = redis.from_url(  # type: ignore[no-untyped-call]
+        client = redis.from_url(
             redis_url,
             socket_connect_timeout=2.0,
             socket_timeout=2.0,
@@ -46,7 +46,7 @@ def _check_redis_health_sync(redis_url: str) -> ComponentHealth:
             client.ping()
 
             # Get basic info for health details
-            info = client.info(section="server")
+            info = cast("dict[str, Any]", client.info(section="server"))
             redis_version = info.get("redis_version", "unknown")
 
             return ComponentHealth(
