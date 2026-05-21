@@ -159,7 +159,7 @@ When login requires human action (login form, CAPTCHA, 2FA, or a bot/WAF interst
 
 mcp = FastMCP(
     name="texas-grocery-mcp",
-    version="0.1.0",
+    version="0.2.0",
     instructions=MCP_INSTRUCTIONS,
     lifespan=lifespan,
 )

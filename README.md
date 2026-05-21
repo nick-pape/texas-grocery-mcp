@@ -2,13 +2,15 @@
 
 [![PyPI version](https://badge.fury.io/py/texas-grocery-mcp.svg)](https://pypi.org/project/texas-grocery-mcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CI](https://github.com/mgwalkerjr95/texas-grocery-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mgwalkerjr95/texas-grocery-mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/nick-pape/texas-grocery-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/nick-pape/texas-grocery-mcp/actions/workflows/ci.yml)
 
 > 🤖 Let AI do your grocery shopping! An MCP server that connects Claude to H-E-B grocery stores.
 
 **Search products, manage your cart, clip coupons, and more — all through natural conversation.**
 
 ⚠️ This project is **not affiliated with H-E-B**. It uses unofficial web APIs and browser automation against HEB.com; use responsibly and ensure your usage complies with applicable terms and laws.
+
+> **Maintained fork.** This is an actively-maintained fork of [`mgwalkerjr95/texas-grocery-mcp`](https://github.com/mgwalkerjr95/texas-grocery-mcp). The upstream repo appears unmaintained (no commits since February 2026, open issues unaddressed), so this fork carries fixes (including self-healing of GraphQL persisted-query hashes that auto-recover when H-E-B rotates them) and is where ongoing development happens. Issues and PRs are welcome here.
 
 ---
 
