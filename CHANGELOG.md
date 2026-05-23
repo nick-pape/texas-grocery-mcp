@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (cookies + localStorage, incl. the `reese84` anti-bot token) from a real Chrome
   started with `--remote-debugging-port`, into Playwright `storageState` JSON. This
   is the reliable recovery when HEB's anti-bot blocks automated/headless re-login.
+- **Background reese84 keep-warm loop:** the server now proactively renews the
+  reese84 anti-bot token on a timer (new `reese84_keepwarm_interval_s` setting, env
+  `REESE84_KEEPWARM_INTERVAL_S`, default `540`s / ~9 min; `0` disables). HEB's token
+  renews ~every 11 min via page-load JS; previously the MCP only refreshed *lazily*
+  before a tool call, so an idle MCP let the token expire and clustered refreshes
+  into op bursts (more anti-bot heat + first-call latency). The loop also fires
+  **once shortly after startup**, so the MCP gets itself into a good state right
+  away instead of sitting idle until the first tool call. Runs as a background task
+  (never blocks startup) and never crashes the server (all failures logged + retried
+  next cycle).
 
 ### Changed
 - `session_save_instructions` now documents the **real-Chrome CDP recapture** flow
@@ -55,6 +65,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a real challenge/login if it did NOT renew. Note this supersedes the
   `auto_refresh_headless` workaround above: **headless is the working mode for HEB**; the
   headed/xvfb path draws a real hCaptcha — keep `AUTO_REFRESH_HEADLESS` unset/`true`.
+- **`session_refresh` no longer reports false success on a stale token:** the
+  headless refresh did a single 5s wait then fell through to "save + success" even
+  when reese84 hadn't actually renewed — so it would persist a stale token, report
+  success, and the *next* operation would fail with "login required". It now (a)
+  **polls** for renewal (~21s, since under load HEB's reese84 JS can take well over
+  5s to issue a fresh token) instead of a one-shot check, and (b) **raises
+  `BrowserRefreshError`** ("reese84 did not renew … retry shortly") when the page
+  loaded fine and we're still authenticated but the token stayed stale — rather than
+  lying about success. Callers/keep-warm retry shortly instead of trusting a dead
+  session.
 
 ## [0.1.2] - 2026-02-02
 

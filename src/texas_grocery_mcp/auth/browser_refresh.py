@@ -353,10 +353,6 @@ async def refresh_session_with_browser(
                         await browser.close()
                         raise BrowserRefreshError(f"HEB.com returned HTTP status {response.status}")
 
-                    # Let the page + Incapsula JS settle so reese84 regenerates.
-                    logger.info("Waiting for reese84 token generation...")
-                    await page.wait_for_timeout(5000)
-
                     # Success is defined by reese84 actually renewing (renewTime moved
                     # into the future), NOT by a page-content heuristic. HEB serves the
                     # real page behind an Incapsula JS shell that the content-based
@@ -364,12 +360,24 @@ async def refresh_session_with_browser(
                     # actually succeed (verified: a raw load renews reese84 with HTTP
                     # 200 while _detect_security_challenge reports a "challenge"). Only
                     # if reese84 did NOT renew do we investigate a real challenge/login.
-                    reese_renewed = await page.evaluate(
+                    #
+                    # POLL for the renewal rather than a single fixed wait: under load
+                    # HEB's reese84 JS can take well over 5s to issue a fresh token, and
+                    # a one-shot check misses it (and then we'd wrongly fall through to
+                    # "success" on a stale token).
+                    logger.info("Waiting for reese84 token to renew...")
+                    reese84_check = (
                         "() => { try { const r = JSON.parse("
                         "window.localStorage.getItem('reese84') || '{}'); "
                         "return typeof r.renewTime === 'number' && r.renewTime > Date.now(); } "
                         "catch (e) { return false; } }"
                     )
+                    reese_renewed = False
+                    for _ in range(7):  # ~21s total
+                        await page.wait_for_timeout(3000)
+                        reese_renewed = await page.evaluate(reese84_check)
+                        if reese_renewed:
+                            break
                     if not reese_renewed:
                         if await _detect_security_challenge(page) or await _detect_captcha(page):
                             await browser.close()
@@ -383,6 +391,17 @@ async def refresh_session_with_browser(
                                 "HEB requires login. Your session has expired.\n"
                                 "Run session_refresh(headless=False) to login manually."
                             )
+                        # Page loaded (HTTP 200) and we're still logged in, but HEB
+                        # did NOT issue a fresh reese84 (renewTime stayed in the
+                        # past). The refresh renewed nothing, so we must NOT fall
+                        # through to "save + success": that would report success,
+                        # persist a stale token, and leave is_authenticated() False
+                        # — misleading the caller into thinking the session is good.
+                        await browser.close()
+                        raise BrowserRefreshError(
+                            "reese84 did not renew (HEB served a stale anti-bot "
+                            "token); session not refreshed — retry shortly."
+                        )
 
                     logger.info("Saving session state", auth_path=str(auth_path))
                     auth_path.parent.mkdir(parents=True, exist_ok=True)

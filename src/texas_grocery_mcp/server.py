@@ -1,7 +1,8 @@
 """Texas Grocery MCP Server - FastMCP entry point."""
 
+import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import structlog
 from fastmcp import FastMCP
@@ -43,6 +44,51 @@ from texas_grocery_mcp.utils.config import get_settings
 configure_logging()
 
 logger = structlog.get_logger()
+
+
+async def _reese84_keepwarm_loop(interval_s: int) -> None:
+    """Background task: proactively renew reese84 so the session stays warm while
+    idle, instead of relying solely on the lazy ensure_session refresh before
+    each tool call. Refreshes once shortly after startup (so the MCP is in a good
+    state immediately, not waiting for the first tool call), then every
+    ``interval_s`` seconds; failures are logged and retried next cycle (never
+    crash the server).
+    """
+    from texas_grocery_mcp.auth.browser_refresh import (
+        BrowserRefreshError,
+        LoginRequiredError,
+        is_playwright_available,
+        refresh_session_with_browser,
+    )
+
+    settings = get_settings()
+    # Refresh shortly after startup so the MCP gets itself into a good state right
+    # away (don't sit idle waiting for a tool call to lazily refresh), then every
+    # interval_s. A short initial delay lets the server finish coming up first.
+    # This runs as a background task, so it never blocks startup either way.
+    await asyncio.sleep(5)
+    while True:
+        try:
+            auth_path = settings.auth_state_path
+            if auth_path.exists() and is_playwright_available():
+                result = await refresh_session_with_browser(
+                    auth_path=auth_path, headless=True, timeout=30000
+                )
+                logger.info(
+                    "keepwarm: reese84 refreshed",
+                    elapsed_seconds=result.get("elapsed_seconds"),
+                )
+        except asyncio.CancelledError:
+            raise
+        except LoginRequiredError:
+            logger.warning(
+                "keepwarm: session fully expired — manual re-capture needed; skipping"
+            )
+        except BrowserRefreshError as e:
+            logger.warning("keepwarm: refresh failed; will retry next cycle", error=str(e))
+        except Exception as e:  # noqa: BLE001 - keep-warm must never crash the server
+            logger.warning("keepwarm: unexpected error", error=str(e))
+        await asyncio.sleep(interval_s)
 
 
 @asynccontextmanager
@@ -93,9 +139,25 @@ async def lifespan(app: FastMCP) -> AsyncIterator[None]:
         except Exception as e:
             logger.warning("Startup session check failed", error=str(e))
 
+    # Background keep-warm: proactively renew reese84 while idle, instead of only
+    # the lazy ensure_session refresh before each tool call.
+    keepwarm_task: asyncio.Task[None] | None = None
+    if settings.reese84_keepwarm_interval_s > 0:
+        keepwarm_task = asyncio.create_task(
+            _reese84_keepwarm_loop(settings.reese84_keepwarm_interval_s)
+        )
+        logger.info(
+            "reese84 keep-warm loop started",
+            interval_s=settings.reese84_keepwarm_interval_s,
+        )
+
     yield  # Server runs here
 
-    # Shutdown: cleanup if needed
+    # Shutdown
+    if keepwarm_task is not None:
+        keepwarm_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await keepwarm_task
     logger.info("MCP server shutting down")
 
 MCP_INSTRUCTIONS = """

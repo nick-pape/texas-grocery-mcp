@@ -170,6 +170,19 @@ class Settings(BaseSettings):
             "to <auth_dir>/browser_ua.txt, which overrides this default."
         ),
     )
+    reese84_keepwarm_interval_s: int = Field(
+        default=540,
+        ge=0,
+        le=3600,
+        description=(
+            "Seconds between BACKGROUND reese84 keep-warm refreshes (0 = disabled). "
+            "HEB's reese84 anti-bot token renews ~every 11 min; refreshing it "
+            "proactively in the background (default ~9 min) keeps the session warm "
+            "while idle, instead of only refreshing lazily before a tool call — which "
+            "adds latency and clusters refreshes into op bursts (more anti-bot heat). "
+            "Independent of auto_refresh_enabled (the lazy ensure_session path)."
+        ),
+    )
 
     def model_post_init(self, __context: Any) -> None:
         """Ensure auth state path is expanded."""
