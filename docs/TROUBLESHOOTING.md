@@ -38,6 +38,48 @@ This guide covers common issues and their solutions when using the Texas Grocery
 
 ---
 
+### Session FULLY expired and login won't work (HEB anti-bot) — real-Chrome recapture
+
+**Symptoms:**
+- `session_status` stays `authenticated: false` even after `session_refresh(headless=True)`
+  (the passive refresh renews the reese84 token but can't re-establish the login).
+- `session_refresh(headless=False)` / auto-login returns HTTP 401, a WAF /
+  "verify you are human" page, or "login result unclear".
+
+**Cause:** HEB's reese84/Incapsula anti-bot rejects *automated* and *headless*
+logins. Once the underlying login session has fully expired, the embedded
+browser can't log back in — it can only keep an already-valid session warm.
+The Playwright-MCP `browser_navigate` / `browser_run_code` flow fails for the
+same reason (it drives an automated browser HEB blocks, and you can't complete
+a human login in it).
+
+**Solution — capture a session from a REAL, human-driven Chrome:**
+```bash
+# 1. Launch a real Chrome with a CLEAN profile + remote debugging
+#    Windows:
+"%ProgramFiles%\Google\Chrome\Application\chrome.exe" ^
+  --remote-debugging-port=9222 --user-data-dir=%TEMP%\heb-capture ^
+  https://www.heb.com/my-account/login
+#    macOS / Linux:
+google-chrome --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/heb-capture https://www.heb.com/my-account/login
+
+# 2. Log in as a human in that window (handle any 2FA/CAPTCHA).
+#    Land on a logged-in page (My Account or the cart).
+
+# 3. Capture the session (cookies + localStorage incl. the reese84 token):
+python scripts/capture_session.py --out /path/to/auth.json
+#    (if the MCP runs in a container, copy the JSON onto its auth volume)
+
+# 4. Verify: session_status  ->  authenticated: true
+```
+Call `session_save_instructions` to get this flow at runtime. A real browser on
+a real/residential IP passes the anti-bot; the captured session then drives the
+API and is kept warm by `session_refresh`. This is the reliable monthly-ish
+recovery when the session truly expires.
+
+---
+
 ### "Security challenge detected" / WAF Block
 
 **Symptoms:**
@@ -98,6 +140,13 @@ This guide covers common issues and their solutions when using the Texas Grocery
    - session_save_credentials(email="your@email.com", password="yourpassword")
 4. Test with session_refresh()
 ```
+
+> **HEB note:** automated/headless credentialed login is unreliable here — HEB's
+> anti-bot 401s it. If re-saving credentials + `session_refresh` doesn't restore
+> auth, use the **real-Chrome recapture** above. Also, `session_refresh` will
+> refuse to auto-login when your stored credentials don't match the account in the
+> saved session (returns `account_mismatch`) — update the stored creds to match,
+> or recapture the intended account's session.
 
 ---
 

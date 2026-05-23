@@ -16,6 +16,7 @@ from texas_grocery_mcp.auth.browser_refresh import (
 from texas_grocery_mcp.auth.credentials import CredentialError, CredentialStore
 from texas_grocery_mcp.auth.session import (
     check_session_freshness,
+    get_session_account_email,
     get_session_info,
     get_session_status,
     is_authenticated,
@@ -148,6 +149,36 @@ async def session_refresh(
                 credentials = cred_store.get()
                 if credentials:
                     email, password = credentials
+                    # SAFETY: never auto-login with credentials that don't match
+                    # the account already saved in auth.json. HEB's anti-bot makes
+                    # credentialed auto-login unreliable anyway, and a mismatched
+                    # login that *did* succeed would overwrite the existing
+                    # account's session with the wrong one (cross-account clobber).
+                    session_email = get_session_account_email()
+                    if session_email and session_email != email.strip().lower():
+                        logger.warning(
+                            "Refusing auto-login: stored credentials do not match "
+                            "the saved session account",
+                            cred_email=_mask_email(email),
+                            session_email=_mask_email(session_email),
+                        )
+                        return {
+                            "success": False,
+                            "status": "failed",
+                            "error_type": "account_mismatch",
+                            "error": (
+                                f"Stored credentials are for {_mask_email(email)} but the "
+                                f"saved session belongs to {_mask_email(session_email)}. "
+                                "Refusing to auto-login because it would replace the "
+                                "existing account's session with the wrong account."
+                            ),
+                            "suggestion": (
+                                "Either update the stored credentials to match the "
+                                "session (session_save_credentials), or recapture the "
+                                "intended account's session manually "
+                                "(see session_save_instructions)."
+                            ),
+                        }
                     # Use visible browser for auto-login (needed for CAPTCHA handoff)
                     result = await auto_login_with_credentials(
                         auth_path=auth_path,
@@ -286,35 +317,64 @@ return {{
 
 
 def session_save_instructions() -> dict[str, Any]:
-    """Get instructions for saving browser session cookies.
+    """Get instructions for (re)capturing a HEB session from a real browser.
 
-    Call this to get step-by-step instructions for authenticating
-    via Playwright MCP and saving the session for fast API access.
+    HEB's reese84/Incapsula anti-bot rejects automated and headless logins
+    (HTTP 401), so once a session has fully expired the only reliable way to
+    re-authenticate is a HUMAN login in a REAL Chrome (a real browser on a
+    real/residential IP passes the anti-bot), then capturing that session into
+    auth.json. This returns that step-by-step flow.
 
-    For automatic session extraction, use session_refresh instead.
+    For routine token refresh of an already-valid session, use session_refresh
+    instead — it keeps the session warm and does NOT require a manual login.
     """
     settings = get_settings()
+    auth_path = str(settings.auth_state_path)
 
     return {
+        "why": (
+            "HEB's reese84/Incapsula anti-bot blocks automated and headless "
+            "logins (HTTP 401). A human login in a normal Chrome passes, so "
+            "recovery = log in as a human in a real browser, then transplant "
+            "that session into auth.json."
+        ),
         "instructions": [
-            "1. Navigate to HEB login page:",
-            "   browser_navigate('https://www.heb.com/my-account/login')",
+            "1. Launch a REAL Chrome with a CLEAN profile + remote debugging:",
+            "   # Windows",
+            '   "%ProgramFiles%\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe" '
+            "--remote-debugging-port=9222 "
+            "--user-data-dir=%TEMP%\\\\heb-capture "
+            "https://www.heb.com/my-account/login",
+            "   # macOS / Linux",
+            "   google-chrome --remote-debugging-port=9222 "
+            "--user-data-dir=/tmp/heb-capture https://www.heb.com/my-account/login",
             "",
-            "2. Complete the login process in the browser",
-            "   (Enter credentials and click Sign In)",
+            "2. Log in as a human in that window (handle any 2FA/CAPTCHA). Land "
+            "on a logged-in page (My Account or the cart).",
             "",
-            "3. After successful login, save the browser state:",
-            "   browser_run_code with this code:",
-            f"   await page.context().storageState({{ path: '{settings.auth_state_path}' }})",
+            "3. Capture the session (cookies + localStorage) via CDP:",
+            f"   python scripts/capture_session.py --out {auth_path}",
+            "   (attaches to the Chrome on :9222 and writes Playwright "
+            "storageState; if this MCP runs in a container, copy the JSON onto "
+            "its auth volume afterwards)",
             "",
-            "4. Verify session was saved:",
-            "   Call session_status to confirm authentication",
+            "4. Verify: call session_status — expect authenticated: true.",
         ],
-        "auth_path": str(settings.auth_state_path),
+        "capture_script": "scripts/capture_session.py",
+        "auth_path": auth_path,
+        "important": (
+            "Do NOT use the Playwright-MCP browser_navigate / browser_run_code "
+            "flow for HEB — that drives an automated browser which the anti-bot "
+            "blocks, and you can't complete a human login in it. Use a real "
+            "Chrome as described above."
+        ),
         "current_status": {
             "authenticated": is_authenticated(),
         },
-        "alternative": "Use session_refresh for automatic session extraction without manual login.",
+        "alternative": (
+            "To refresh an already-valid session's tokens (no login needed), use "
+            "session_refresh."
+        ),
     }
 
 

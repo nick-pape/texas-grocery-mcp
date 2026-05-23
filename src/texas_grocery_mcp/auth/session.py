@@ -6,6 +6,7 @@ Provides cookie conversion for httpx-based API requests.
 
 import json
 import time
+import urllib.parse
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -486,6 +487,37 @@ def get_session_info() -> dict[str, Any]:
         logger.warning("Failed to read session info", error=str(e))
 
     return info
+
+
+def get_session_account_email() -> str | None:
+    """Return the HEB account email of the saved session, if discoverable.
+
+    HEB stores the logged-in email in the ``loginEmail`` cookie (URL-encoded).
+    This is used to guard against an auto-login overwriting one account's saved
+    session with a different account's credentials (see the auto-login flow in
+    ``tools.session.session_refresh``).
+
+    Returns:
+        The lowercased account email, or None if no session / cookie is found.
+    """
+    settings = get_settings()
+    auth_path = settings.auth_state_path
+
+    if not auth_path.exists():
+        return None
+
+    try:
+        with open(auth_path) as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    for cookie in state.get("cookies", []):
+        if cookie.get("name") == "loginEmail" and "heb.com" in cookie.get("domain", ""):
+            value = urllib.parse.unquote(cookie.get("value", "")).strip()
+            return value.lower() or None
+
+    return None
 
 
 # Refresh threshold: recommend refresh when less than this many hours remain

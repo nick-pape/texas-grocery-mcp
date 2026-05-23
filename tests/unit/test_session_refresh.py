@@ -930,3 +930,134 @@ class TestSecurityChallengeDetection:
 
         assert len(large_page) > 5000  # Verify it's actually large
         assert _detect_security_challenge_html(large_page) is False
+
+
+# =============================================================================
+# Account-match guard: never auto-login with a mismatched account
+# =============================================================================
+
+
+def _session_with_login_email(email_urlencoded: str) -> dict:
+    """Minimal auth state carrying a loginEmail cookie."""
+    return {
+        "cookies": [
+            {
+                "name": "loginEmail",
+                "value": email_urlencoded,
+                "domain": "www.heb.com",
+                "path": "/",
+                "expires": -1,
+            }
+        ],
+        "origins": [],
+    }
+
+
+def test_get_session_account_email_reads_loginemail(mock_auth_path):
+    """get_session_account_email decodes + lowercases the loginEmail cookie."""
+    from texas_grocery_mcp.auth.session import get_session_account_email
+
+    mock_auth_path.write_text(json.dumps(_session_with_login_email("Katie%40gmail.com")))
+
+    assert get_session_account_email() == "katie@gmail.com"
+
+
+def test_get_session_account_email_none_when_absent(mock_auth_path):
+    """get_session_account_email returns None when no loginEmail cookie present."""
+    from texas_grocery_mcp.auth.session import get_session_account_email
+
+    mock_auth_path.write_text(
+        json.dumps(
+            {
+                "cookies": [{"name": "sat", "value": "x", "domain": "www.heb.com"}],
+                "origins": [],
+            }
+        )
+    )
+
+    assert get_session_account_email() is None
+
+
+@pytest.mark.asyncio
+async def test_session_refresh_refuses_account_mismatch(mock_auth_path, monkeypatch):
+    """Auto-login must NOT fire when stored creds differ from the saved session
+    account — it would clobber the live session with the wrong account."""
+    from texas_grocery_mcp.auth.browser_refresh import LoginRequiredError
+    from texas_grocery_mcp.tools import session as session_tools
+
+    # Saved session belongs to katie (loginEmail cookie).
+    mock_auth_path.write_text(json.dumps(_session_with_login_email("katiepduncan%40gmail.com")))
+
+    # Playwright "available", but the headless refresh reports login required.
+    monkeypatch.setattr(session_tools, "is_playwright_available", lambda: True)
+
+    async def _raise_login_required(**kwargs):
+        raise LoginRequiredError("expired")
+
+    monkeypatch.setattr(session_tools, "refresh_session_with_browser", _raise_login_required)
+
+    # Stored credentials are for a DIFFERENT account (nick).
+    class FakeCredStore:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def has_credentials(self):
+            return True
+
+        def get(self):
+            return ("nickpape@outlook.com", "pw")
+
+    monkeypatch.setattr(session_tools, "CredentialStore", FakeCredStore)
+
+    # auto_login must never be reached on a mismatch.
+    async def _boom(**kwargs):
+        raise AssertionError("auto_login_with_credentials must not be called on mismatch")
+
+    monkeypatch.setattr(session_tools, "auto_login_with_credentials", _boom)
+
+    result = await session_tools.session_refresh()
+
+    assert result["success"] is False
+    assert result["error_type"] == "account_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_session_refresh_allows_matching_account(mock_auth_path, monkeypatch):
+    """Auto-login proceeds when stored creds match the saved session account
+    (case-insensitively)."""
+    from texas_grocery_mcp.auth.browser_refresh import LoginRequiredError
+    from texas_grocery_mcp.tools import session as session_tools
+
+    mock_auth_path.write_text(json.dumps(_session_with_login_email("katiepduncan%40gmail.com")))
+
+    monkeypatch.setattr(session_tools, "is_playwright_available", lambda: True)
+
+    async def _raise_login_required(**kwargs):
+        raise LoginRequiredError("expired")
+
+    monkeypatch.setattr(session_tools, "refresh_session_with_browser", _raise_login_required)
+
+    class FakeCredStore:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def has_credentials(self):
+            return True
+
+        def get(self):
+            return ("KatiePDuncan@gmail.com", "pw")  # different case, same account
+
+    monkeypatch.setattr(session_tools, "CredentialStore", FakeCredStore)
+
+    called = {}
+
+    async def _login(**kwargs):
+        called["yes"] = True
+        return {"status": "success", "success": True}
+
+    monkeypatch.setattr(session_tools, "auto_login_with_credentials", _login)
+
+    result = await session_tools.session_refresh()
+
+    assert called.get("yes") is True
+    assert result["status"] == "success"
