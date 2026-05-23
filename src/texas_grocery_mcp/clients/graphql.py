@@ -7,6 +7,7 @@ modes. Authenticated mode uses browser session cookies for faster API access.
 import asyncio
 import json
 import re
+from collections.abc import ItemsView, Iterator, KeysView
 from pathlib import Path
 from typing import Any, cast
 
@@ -118,7 +119,7 @@ class HashStore:
     def __getitem__(self, op: str) -> str:
         return self._effective[op]
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[str]:
         return iter(self._effective)
 
     def __len__(self) -> int:
@@ -127,10 +128,10 @@ class HashStore:
     def get(self, op: str, default: str | None = None) -> str | None:
         return self._effective.get(op, default)
 
-    def items(self):
+    def items(self) -> ItemsView[str, str]:
         return self._effective.items()
 
-    def keys(self):
+    def keys(self) -> KeysView[str]:
         return self._effective.keys()
 
     @property
