@@ -328,6 +328,16 @@ async def refresh_session_with_browser(
                     browser = await p.chromium.launch(
                         headless=True,
                         args=[
+                            # Container-hardening: Chrome's default shared-memory
+                            # dir is the container's /dev/shm, which is only 64 MB
+                            # by default — Chrome exhausts it and crashes (leaving
+                            # defunct zombies + a refresh that never renews
+                            # reese84). --disable-dev-shm-usage moves it to /tmp;
+                            # --no-sandbox is required when running as a non-root
+                            # uid in a container without user-namespace setup.
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--disable-gpu",
                             "--disable-blink-features=AutomationControlled",
                             "--no-first-run",
                             "--no-default-browser-check",
@@ -465,6 +475,10 @@ async def refresh_session_with_browser(
             browser = await playwright.chromium.launch(
                 headless=False,
                 args=[
+                    # Container-hardening (see the headless refresh above): avoid
+                    # the 64 MB /dev/shm crash + non-root sandbox failure.
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
                     "--no-first-run",
                     "--no-default-browser-check",
@@ -853,6 +867,10 @@ async def auto_login_with_credentials(
             browser = await playwright.chromium.launch(
                 headless=headless,
                 args=[
+                    # Container-hardening (see the headless refresh above): avoid
+                    # the 64 MB /dev/shm crash + non-root sandbox failure.
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
                     "--no-first-run",
                     "--no-default-browser-check",

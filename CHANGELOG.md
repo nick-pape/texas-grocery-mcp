@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automated browser).
 
 ### Fixed
+- **Container-hardened the refresh browser (the reliability linchpin):** the
+  Playwright Chromium launch lacked `--no-sandbox` / `--disable-dev-shm-usage`, so
+  in a container it used the default 64 MB `/dev/shm` and crashed under memory
+  pressure — leaving defunct Chrome zombies and a refresh that launched but never
+  renewed reese84 (so keep-warm + the lazy `ensure_session` refresh silently did
+  nothing and the session died on idle). Added `--no-sandbox`,
+  `--disable-dev-shm-usage`, and `--disable-gpu` to all browser launches. This is
+  what makes the in-container refresh reliable, which both keep-warm and the
+  per-call lazy refresh depend on.
 - **Account-mismatch guard:** `session_refresh` no longer auto-logs-in with stored
   credentials when they belong to a *different* account than the saved session.
   Previously a mismatched auto-login that happened to succeed would overwrite the
