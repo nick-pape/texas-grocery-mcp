@@ -7,7 +7,6 @@ modes. Authenticated mode uses browser session cookies for faster API access.
 import asyncio
 import json
 import re
-from collections.abc import ItemsView, Iterator, KeysView
 from pathlib import Path
 from typing import Any, cast
 
@@ -119,7 +118,7 @@ class HashStore:
     def __getitem__(self, op: str) -> str:
         return self._effective[op]
 
-    def __iter__(self) -> Iterator[str]:
+    def __iter__(self):
         return iter(self._effective)
 
     def __len__(self) -> int:
@@ -128,10 +127,10 @@ class HashStore:
     def get(self, op: str, default: str | None = None) -> str | None:
         return self._effective.get(op, default)
 
-    def items(self) -> ItemsView[str, str]:
+    def items(self):
         return self._effective.items()
 
-    def keys(self) -> KeysView[str]:
+    def keys(self):
         return self._effective.keys()
 
     @property
@@ -348,7 +347,7 @@ class HEBGraphQLClient:
 
         # Look for build ID in the HTML
         # Pattern: /_next/static/{buildId}/_buildManifest.js
-        match = re.search(r'/_next/static/([a-zA-Z0-9_-]+)/_buildManifest\.js', response.text)
+        match = re.search(r"/_next/static/([a-zA-Z0-9_-]+)/_buildManifest\.js", response.text)
         if match:
             self._build_id = match.group(1)
             logger.info("Extracted Next.js build ID", build_id=self._build_id)
@@ -664,10 +663,12 @@ class HEBGraphQLClient:
         for query in query_variations:
             try:
                 result_stores = await self._execute_store_search(query, radius_miles)
-                attempts.append(SearchAttempt(
-                    query=query,
-                    result="success" if result_stores else "no_stores",
-                ))
+                attempts.append(
+                    SearchAttempt(
+                        query=query,
+                        result="success" if result_stores else "no_stores",
+                    )
+                )
 
                 if result_stores:
                     stores = result_stores
@@ -699,11 +700,7 @@ class HEBGraphQLClient:
                     )
             # Sort by calculated distance
             stores.sort(
-                key=lambda s: (
-                    s.distance_miles
-                    if s.distance_miles is not None
-                    else float("inf")
-                )
+                key=lambda s: s.distance_miles if s.distance_miles is not None else float("inf")
             )
 
         # Step 5: Build response with feedback
@@ -719,9 +716,7 @@ class HEBGraphQLClient:
                 ]
             else:
                 location = geocoded.display_name if geocoded else address
-                error = (
-                    f"No HEB stores found within {radius_miles} miles of {location}."
-                )
+                error = f"No HEB stores found within {radius_miles} miles of {location}."
                 suggestions = [
                     "HEB operates primarily in Texas",
                     "Try increasing the search radius",
@@ -830,24 +825,20 @@ class HEBGraphQLClient:
         if store_fulfillments is not None:
             # Build list of fulfillment channel names
             fulfillment_names = [
-                f.get("name", "")
-                for f in store_fulfillments
-                if isinstance(f, dict)
+                f.get("name", "") for f in store_fulfillments if isinstance(f, dict)
             ]
             # Curbside = any fulfillment containing "CURBSIDE" (CURBSIDE_PICKUP, CURBSIDE_DELIVERY)
             supports_curbside = any("CURBSIDE" in name for name in fulfillment_names)
             # Delivery = ALCOHOL_DELIVERY or DELIVERY channel
             supports_delivery = any(
-                "DELIVERY" in name and "CURBSIDE" not in name
-                for name in fulfillment_names
+                "DELIVERY" in name and "CURBSIDE" not in name for name in fulfillment_names
             )
         else:
             # Legacy format: check fulfillmentChannels array of strings
             fulfillment_channels = store_data.get("fulfillmentChannels", None)
             if fulfillment_channels is not None:
                 supports_curbside = (
-                    "PICKUP" in fulfillment_channels
-                    or "CURBSIDE" in fulfillment_channels
+                    "PICKUP" in fulfillment_channels or "CURBSIDE" in fulfillment_channels
                 )
                 supports_delivery = "DELIVERY" in fulfillment_channels
             else:
@@ -946,13 +937,24 @@ class HEBGraphQLClient:
                 break
 
         # Add "Meal Simple" prefix for meal-related queries
-        meal_keywords = ["steak", "chicken", "salmon", "pork", "beef", "shrimp",
-                         "asparagus", "potato", "meatloaf", "alfredo", "enchilada",
-                         "jambalaya", "bowl", "dinner", "entree"]
-        if (
-            any(kw in query_lower for kw in meal_keywords)
-            and "meal simple" not in query_lower
-        ):
+        meal_keywords = [
+            "steak",
+            "chicken",
+            "salmon",
+            "pork",
+            "beef",
+            "shrimp",
+            "asparagus",
+            "potato",
+            "meatloaf",
+            "alfredo",
+            "enchilada",
+            "jambalaya",
+            "bowl",
+            "dinner",
+            "entree",
+        ]
+        if any(kw in query_lower for kw in meal_keywords) and "meal simple" not in query_lower:
             variations.append(f"Meal Simple {query}")
 
         # Add "H-E-B" prefix if not present
@@ -1148,11 +1150,13 @@ class HEBGraphQLClient:
 
                     if was_challenge:
                         security_challenge_detected = True
-                        attempts.append(ProductSearchAttempt(
-                            query=variation,
-                            method="ssr",
-                            result="security_challenge",
-                        ))
+                        attempts.append(
+                            ProductSearchAttempt(
+                                query=variation,
+                                method="ssr",
+                                result="security_challenge",
+                            )
+                        )
                         logger.error(
                             (
                                 "Security challenge detected - stopping search attempts, "
@@ -1164,11 +1168,13 @@ class HEBGraphQLClient:
                         break
 
                     if products:
-                        attempts.append(ProductSearchAttempt(
-                            query=variation,
-                            method="ssr",
-                            result="success",
-                        ))
+                        attempts.append(
+                            ProductSearchAttempt(
+                                query=variation,
+                                method="ssr",
+                                result="success",
+                            )
+                        )
                         logger.info(
                             "SSR search successful",
                             original_query=query,
@@ -1186,19 +1192,23 @@ class HEBGraphQLClient:
                             search_url=search_url,
                         )
                     else:
-                        attempts.append(ProductSearchAttempt(
-                            query=variation,
-                            method="ssr",
-                            result="empty",
-                        ))
+                        attempts.append(
+                            ProductSearchAttempt(
+                                query=variation,
+                                method="ssr",
+                                result="empty",
+                            )
+                        )
 
                 except Exception as e:
-                    attempts.append(ProductSearchAttempt(
-                        query=variation,
-                        method="ssr",
-                        result="error",
-                        error_detail=str(e),
-                    ))
+                    attempts.append(
+                        ProductSearchAttempt(
+                            query=variation,
+                            method="ssr",
+                            result="error",
+                            error_detail=str(e),
+                        )
+                    )
                     logger.warning(
                         "Authenticated search failed for variation",
                         query=variation,
@@ -1220,20 +1230,24 @@ class HEBGraphQLClient:
 
                                 if was_challenge:
                                     security_challenge_detected = True
-                                    attempts.append(ProductSearchAttempt(
-                                        query=suggestion,
-                                        method="typeahead_as_ssr",
-                                        result="security_challenge",
-                                    ))
+                                    attempts.append(
+                                        ProductSearchAttempt(
+                                            query=suggestion,
+                                            method="typeahead_as_ssr",
+                                            result="security_challenge",
+                                        )
+                                    )
                                     # Fail-fast: don't try more suggestions
                                     break
 
                                 if products:
-                                    attempts.append(ProductSearchAttempt(
-                                        query=suggestion,
-                                        method="typeahead_as_ssr",
-                                        result="success",
-                                    ))
+                                    attempts.append(
+                                        ProductSearchAttempt(
+                                            query=suggestion,
+                                            method="typeahead_as_ssr",
+                                            result="success",
+                                        )
+                                    )
                                     logger.info(
                                         "SSR search successful via typeahead suggestion",
                                         original_query=query,
@@ -1251,19 +1265,23 @@ class HEBGraphQLClient:
                                         search_url=search_url,
                                     )
                                 else:
-                                    attempts.append(ProductSearchAttempt(
-                                        query=suggestion,
-                                        method="typeahead_as_ssr",
-                                        result="empty",
-                                    ))
+                                    attempts.append(
+                                        ProductSearchAttempt(
+                                            query=suggestion,
+                                            method="typeahead_as_ssr",
+                                            result="empty",
+                                        )
+                                    )
 
                             except Exception as e:
-                                attempts.append(ProductSearchAttempt(
-                                    query=suggestion,
-                                    method="typeahead_as_ssr",
-                                    result="error",
-                                    error_detail=str(e),
-                                ))
+                                attempts.append(
+                                    ProductSearchAttempt(
+                                        query=suggestion,
+                                        method="typeahead_as_ssr",
+                                        result="error",
+                                        error_detail=str(e),
+                                    )
+                                )
                                 continue
                 except Exception as e:
                     logger.debug("Typeahead-guided search failed", error=str(e))
@@ -1324,11 +1342,13 @@ class HEBGraphQLClient:
                 original_price=None,
             )
             products.append(product)
-            attempts.append(ProductSearchAttempt(
-                query=suggestion,
-                method="typeahead",
-                result="success",
-            ))
+            attempts.append(
+                ProductSearchAttempt(
+                    query=suggestion,
+                    method="typeahead",
+                    result="success",
+                )
+            )
 
         return ProductSearchResult(
             products=products,
@@ -1458,11 +1478,9 @@ class HEBGraphQLClient:
                 response.raise_for_status()
 
                 # Check for security challenge
-                if response.headers.get(
-                    "content-type", ""
-                ).startswith("text/html") and self._detect_security_challenge(
-                    response.text
-                ):
+                if response.headers.get("content-type", "").startswith(
+                    "text/html"
+                ) and self._detect_security_challenge(response.text):
                     logger.warning(
                         "Security challenge detected in product details response",
                         product_id=product_id,
@@ -1480,9 +1498,7 @@ class HEBGraphQLClient:
 
                 if not product_data:
                     page_props_keys = (
-                        list(data.get("pageProps", {}).keys())
-                        if "pageProps" in data
-                        else None
+                        list(data.get("pageProps", {}).keys()) if "pageProps" in data else None
                     )
                     logger.warning(
                         "No product data in response",
@@ -1694,13 +1710,15 @@ class HEBGraphQLClient:
             if n.get("subItems"):
                 sub_items = self._parse_nutrients(n["subItems"])
 
-            result.append(NutrientInfo(
-                title=n.get("title", ""),
-                unit=n.get("unit", ""),
-                percentage=n.get("percentage"),
-                font_modifier=n.get("fontModifier"),
-                sub_items=sub_items,
-            ))
+            result.append(
+                NutrientInfo(
+                    title=n.get("title", ""),
+                    unit=n.get("unit", ""),
+                    percentage=n.get("percentage"),
+                    font_modifier=n.get("fontModifier"),
+                    sub_items=sub_items,
+                )
+            )
         return result
 
     @with_retry(config=RetryConfig(max_attempts=2, base_delay=0.5))
@@ -2263,11 +2281,13 @@ class HEBGraphQLClient:
 
         for cat in product_categories:
             try:
-                categories.append(CouponCategory(
-                    id=cat.get("option", 0),
-                    name=cat.get("displayName", ""),
-                    count=cat.get("count", 0),
-                ))
+                categories.append(
+                    CouponCategory(
+                        id=cat.get("option", 0),
+                        name=cat.get("displayName", ""),
+                        count=cat.get("count", 0),
+                    )
+                )
             except Exception:
                 continue
 
@@ -2298,6 +2318,7 @@ class HEBGraphQLClient:
             # Convert YYYY-MM-DD to more readable format
             try:
                 from datetime import datetime
+
                 dt = datetime.strptime(exp_date, "%Y-%m-%d")
                 expires_display = dt.strftime("%m/%d/%Y")
             except Exception:
@@ -2424,9 +2445,7 @@ class HEBGraphQLClient:
                 categories=[],
             )
 
-    async def select_store(
-        self, store_id: str, ignore_conflicts: bool = False
-    ) -> dict[str, Any]:
+    async def select_store(self, store_id: str, ignore_conflicts: bool = False) -> dict[str, Any]:
         """Change the active store via GraphQL mutation with verification.
 
         This calls the SelectPickupFulfillment mutation which changes
