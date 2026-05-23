@@ -734,13 +734,31 @@ async def auto_refresh_session_if_needed() -> dict[str, Any] | None:
 
         result = await refresh_session_with_browser(
             auth_path=auth_path,
-            headless=True,
+            headless=settings.auto_refresh_headless,
             timeout=30000,
         )
 
+        # In headed mode a fully-expired session returns a human-handoff dict
+        # instead of raising LoginRequiredError (it opens a login page). Don't
+        # leave that browser hanging in a non-interactive context — clean up and
+        # surface a clear "manual re-capture" error.
+        if isinstance(result, dict) and result.get("status") == "human_action_required":
+            from texas_grocery_mcp.auth.browser_refresh import clear_pending_login
+
+            clear_pending_login()
+            return {
+                "error": True,
+                "code": "LOGIN_REQUIRED",
+                "message": (
+                    "Your HEB session has fully expired and needs a manual "
+                    "re-capture. See session_save_instructions."
+                ),
+                "auto_refresh_attempted": True,
+            }
+
         logger.info(
             "Session auto-refreshed successfully",
-            elapsed_seconds=result.get("elapsed_seconds"),
+            elapsed_seconds=(result or {}).get("elapsed_seconds"),
         )
         return None
 

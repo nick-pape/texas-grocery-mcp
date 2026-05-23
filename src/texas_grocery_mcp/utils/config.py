@@ -145,6 +145,17 @@ class Settings(BaseSettings):
             "login should be explicit)"
         ),
     )
+    auto_refresh_headless: bool = Field(
+        default=True,
+        description=(
+            "Run the automatic background session refresh in headless mode. "
+            "Set False in environments with a virtual display (e.g. xvfb in a "
+            "container): HEB's Incapsula anti-bot returns HTTP 401 to the headless "
+            "browser, so a headless auto-refresh can never renew the reese84 token "
+            "and the session silently dies. A headed browser under xvfb passes the "
+            "anti-bot, keeping the session self-sustaining."
+        ),
+    )
 
     def model_post_init(self, __context: Any) -> None:
         """Ensure auth state path is expanded."""
