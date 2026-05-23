@@ -38,7 +38,7 @@ from texas_grocery_mcp.reliability import (
     with_retry,
 )
 from texas_grocery_mcp.services.geocoding import GeocodingResult, GeocodingService
-from texas_grocery_mcp.utils.config import get_settings
+from texas_grocery_mcp.utils.config import get_browser_user_agent, get_settings
 
 logger = structlog.get_logger()
 
@@ -239,6 +239,13 @@ class HEBGraphQLClient:
     def __init__(self, base_url: str | None = None):
         settings = get_settings()
         self.base_url = base_url or settings.heb_graphql_url
+        # Per-instance copy of the browser headers with a User-Agent that matches
+        # the captured session's browser. HEB's Incapsula binds the reese84 token
+        # to the UA; a mismatched UA on the API client gets the request rejected.
+        self._BROWSER_HEADERS = {
+            **type(self)._BROWSER_HEADERS,
+            "User-Agent": get_browser_user_agent(),
+        }
         self.circuit_breaker = CircuitBreaker("heb_api")
         self._client: httpx.AsyncClient | None = None
         self._auth_client: httpx.AsyncClient | None = None

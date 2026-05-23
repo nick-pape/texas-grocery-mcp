@@ -156,6 +156,20 @@ class Settings(BaseSettings):
             "anti-bot, keeping the session self-sustaining."
         ),
     )
+    heb_browser_user_agent: str = Field(
+        default=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        ),
+        description=(
+            "User-Agent for BOTH the Playwright refresh browser and the httpx API "
+            "client. MUST match the browser the session was captured from: HEB's "
+            "Incapsula binds the reese84 token to the browser UA/fingerprint and "
+            "REFUSES to renew it for a mismatched UA (the token's renewTime freezes "
+            "and the session silently dies). capture_session.py writes the real UA "
+            "to <auth_dir>/browser_ua.txt, which overrides this default."
+        ),
+    )
 
     def model_post_init(self, __context: Any) -> None:
         """Ensure auth state path is expanded."""
@@ -169,3 +183,28 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
+
+
+def get_browser_user_agent() -> str:
+    """Resolve the User-Agent for the refresh browser + httpx API client.
+
+    Prefers ``<auth_dir>/browser_ua.txt`` (written by capture_session.py from the
+    real browser the session was captured in) so the UA always matches the
+    captured fingerprint; falls back to ``settings.heb_browser_user_agent``.
+    Read fresh on each call (not cached) so a re-capture takes effect without a
+    process restart.
+
+    HEB's Incapsula binds the reese84 anti-bot token to the browser UA: if the
+    refresh/API UA doesn't match the UA the token was issued under, Incapsula
+    won't renew it (renewTime freezes) and the session silently dies.
+    """
+    settings = get_settings()
+    try:
+        sidecar = Path(settings.auth_state_path).expanduser().parent / "browser_ua.txt"
+        if sidecar.exists():
+            ua = sidecar.read_text(encoding="utf-8").strip()
+            if ua:
+                return ua
+    except OSError:
+        pass
+    return settings.heb_browser_user_agent

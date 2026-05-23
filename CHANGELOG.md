@@ -36,6 +36,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes the anti-bot, keeping the session self-sustaining. When headed mode
   hits a fully-expired session it now cleans up the handoff browser and returns
   `LOGIN_REQUIRED` instead of leaving it hanging.
+- **User-Agent now matches the captured session (reese84-renewal fix):** the
+  refresh browser **and** the httpx API client hardcoded a `Mac Chrome 120` UA,
+  but sessions captured from a real browser carry that browser's UA (e.g. Windows
+  Chrome). HEB's Incapsula **binds the reese84 token to the browser UA and
+  silently refuses to renew it for a mismatched UA** — every refresh returned
+  HTTP 200 but the token's `renewTime` froze, so the session died with no error.
+  Added `heb_browser_user_agent` setting + `get_browser_user_agent()` which
+  prefers `<auth_dir>/browser_ua.txt` (written by `capture_session.py` from the
+  real capture browser). All 3 Playwright contexts + the API client now use it,
+  so refresh/API always match the captured fingerprint.
 
 ## [0.1.2] - 2026-02-02
 

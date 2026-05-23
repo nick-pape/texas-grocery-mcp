@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 try:
     from playwright.sync_api import sync_playwright
@@ -95,13 +96,16 @@ def main() -> None:
         # cookies come back here; origins (localStorage) is empty over CDP.
         state = ctx.storage_state()
 
-        # Collect localStorage from the live page(s) ourselves.
+        # Collect localStorage + the browser User-Agent from the live page(s).
         origins: dict[str, list[dict[str, str]]] = {}
+        user_agent: str | None = None
         for page in ctx.pages:
             if args.origin_filter and args.origin_filter not in page.url:
                 continue
             try:
                 origin = page.evaluate("() => location.origin")
+                if user_agent is None:
+                    user_agent = page.evaluate("() => navigator.userAgent")
                 entries = page.evaluate(
                     "() => Object.entries(window.localStorage)"
                     ".map(([name, value]) => ({ name, value }))"
@@ -117,6 +121,15 @@ def main() -> None:
 
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(state, fh, indent=2)
+
+        # Write the captured browser's User-Agent next to auth.json. The MCP's
+        # refresh browser + httpx API client read this so their UA matches the
+        # captured session — HEB's Incapsula binds the reese84 token to the UA
+        # and refuses to renew it for a mismatched browser (token freezes).
+        if user_agent:
+            ua_path = Path(args.out).resolve().parent / "browser_ua.txt"
+            ua_path.write_text(user_agent, encoding="utf-8")
+            print(f"wrote {ua_path}\n  UA: {user_agent}")
         browser.close()
 
     cookies = state.get("cookies", [])

@@ -17,6 +17,8 @@ from typing import Any, Literal, TypedDict
 
 import structlog
 
+from texas_grocery_mcp.utils.config import get_browser_user_agent
+
 logger = structlog.get_logger()
 
 # Check if playwright is available (optional dependency)
@@ -335,11 +337,7 @@ async def refresh_session_with_browser(
 
                     storage_state = str(auth_path) if auth_path.exists() else None
                     context = await browser.new_context(
-                        user_agent=(
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36"
-                        ),
+                        user_agent=get_browser_user_agent(),
                         storage_state=storage_state,
                     )
 
@@ -450,11 +448,7 @@ async def refresh_session_with_browser(
                 )
 
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
+                user_agent=get_browser_user_agent(),
                 storage_state=storage_state,
             )
             page = await context.new_page()
@@ -835,11 +829,7 @@ async def auto_login_with_credentials(
             )
 
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
+                user_agent=get_browser_user_agent(),
             )
 
             page = await context.new_page()
