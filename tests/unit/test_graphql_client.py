@@ -205,7 +205,16 @@ async def test_handles_graphql_error(client):
 @pytest.mark.asyncio
 @respx.mock
 async def test_persisted_query_not_found_error(client):
-    """Should raise PersistedQueryNotFoundError when hash is invalid."""
+    """Should raise PersistedQueryNotFoundError when hash is invalid.
+
+    The fork adds self-heal-on-stale-hash: on PersistedQueryNotFound,
+    the client invokes hash_rediscover to refresh the hash and retries
+    once. This test asserts the error STILL propagates when rediscovery
+    can't recover (returns empty), so we mock the rediscovery call.
+    Live Playwright must NOT be invoked in unit tests.
+    """
+    from unittest.mock import AsyncMock, patch
+
     mock_response = {
         "errors": [
             {
@@ -222,8 +231,13 @@ async def test_persisted_query_not_found_error(client):
 
     from texas_grocery_mcp.clients.graphql import PersistedQueryNotFoundError
 
-    # Test the underlying method directly
-    with pytest.raises(PersistedQueryNotFoundError):
+    with (
+        patch(
+            "texas_grocery_mcp.clients.hash_rediscover.rediscover_hashes",
+            AsyncMock(return_value={}),
+        ),
+        pytest.raises(PersistedQueryNotFoundError),
+    ):
         await client._execute_persisted_query(
             "typeaheadContent",
             {"term": "test", "searchMode": "MAIN_SEARCH"},
