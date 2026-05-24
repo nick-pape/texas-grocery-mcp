@@ -352,42 +352,56 @@ async def refresh_session_with_browser(
                     )
 
                     page = await context.new_page()
-                    logger.info("Navigating to HEB.com...")
-                    response = await page.goto(
-                        "https://www.heb.com",
-                        wait_until="load",
-                        timeout=timeout,
-                    )
 
-                    if response and response.status >= 400:
-                        await browser.close()
-                        raise BrowserRefreshError(f"HEB.com returned HTTP status {response.status}")
-
-                    # Success is defined by reese84 actually renewing (renewTime moved
-                    # into the future), NOT by a page-content heuristic. HEB serves the
-                    # real page behind an Incapsula JS shell that the content-based
+                    # Success is defined by reese84 being valid (renewTime in the
+                    # future), NOT by a page-content heuristic. HEB serves the real
+                    # page behind an Incapsula JS shell that the content-based
                     # challenge detector mis-flags, so it false-aborts refreshes that
                     # actually succeed (verified: a raw load renews reese84 with HTTP
                     # 200 while _detect_security_challenge reports a "challenge"). Only
-                    # if reese84 did NOT renew do we investigate a real challenge/login.
-                    #
-                    # POLL for the renewal rather than a single fixed wait: under load
-                    # HEB's reese84 JS can take well over 5s to issue a fresh token, and
-                    # a one-shot check misses it (and then we'd wrongly fall through to
-                    # "success" on a stale token).
-                    logger.info("Waiting for reese84 token to renew...")
+                    # if reese84 stays stale do we investigate a real challenge/login.
                     reese84_check = (
                         "() => { try { const r = JSON.parse("
                         "window.localStorage.getItem('reese84') || '{}'); "
                         "return typeof r.renewTime === 'number' && r.renewTime > Date.now(); } "
                         "catch (e) { return false; } }"
                     )
+
+                    # RETRY with reload: HEB's Incapsula renewal is probabilistic
+                    # under anti-bot heat — a given page load may not issue a fresh
+                    # token, but a reload frequently does. We load, then POLL for
+                    # renewal (~15s; the JS can take well over 5s under load), and if
+                    # it hasn't renewed, reload and try again. This resilience is what
+                    # makes BOTH the keep-warm loop and the per-call lazy refresh keep
+                    # the session alive across HEB's flaky renewal, instead of
+                    # honest-failing on the first uncooperative load.
+                    response = None
                     reese_renewed = False
-                    for _ in range(7):  # ~21s total
-                        await page.wait_for_timeout(3000)
-                        reese_renewed = await page.evaluate(reese84_check)
+                    for attempt in range(3):
+                        if attempt == 0:
+                            logger.info("Navigating to HEB.com...")
+                            response = await page.goto(
+                                "https://www.heb.com", wait_until="load", timeout=timeout
+                            )
+                        else:
+                            logger.info("reese84 still stale; reloading", attempt=attempt + 1)
+                            response = await page.reload(wait_until="load", timeout=timeout)
+
+                        if response and response.status >= 400:
+                            await browser.close()
+                            raise BrowserRefreshError(
+                                f"HEB.com returned HTTP status {response.status}"
+                            )
+
+                        logger.info("Waiting for reese84 token to renew...", attempt=attempt + 1)
+                        for _ in range(5):  # ~15s poll per attempt
+                            await page.wait_for_timeout(3000)
+                            reese_renewed = await page.evaluate(reese84_check)
+                            if reese_renewed:
+                                break
                         if reese_renewed:
                             break
+
                     if not reese_renewed:
                         if await _detect_security_challenge(page) or await _detect_captcha(page):
                             await browser.close()

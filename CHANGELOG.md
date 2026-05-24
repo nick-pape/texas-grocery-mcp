@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automated browser).
 
 ### Fixed
+- **Refresh now retries with a reload before giving up:** HEB's Incapsula reese84
+  renewal is probabilistic under anti-bot heat — a given page load may not issue a
+  fresh token, but a reload frequently does. The headless refresh now loads, polls
+  ~15s for renewal, and if the token is still stale **reloads and retries** (up to
+  3 attempts) instead of honest-failing on the first uncooperative load. This is
+  what lets both the keep-warm loop and the per-call lazy `ensure_session` refresh
+  keep the session alive across HEB's flaky renewal (the "logged-in semantics are
+  invisible to the agent, tools just work" guarantee).
 - **Container-hardened the refresh browser (the reliability linchpin):** the
   Playwright Chromium launch lacked `--no-sandbox` / `--disable-dev-shm-usage`, so
   in a container it used the default 64 MB `/dev/shm` and crashed under memory
