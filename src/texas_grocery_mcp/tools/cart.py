@@ -49,11 +49,34 @@ def _extract_sku_from_cart_item(item: dict[str, Any]) -> str | None:
     return None
 
 
+def _extract_name_from_cart_item(item: dict[str, Any]) -> str | None:
+    """Extract the product display name from a cart item (cartV2 + legacy shapes)."""
+    # cartV2 (mobile bearer): the name lives on the SKU, or product.fullDisplayName.
+    sku = item.get("sku")
+    if isinstance(sku, dict) and sku.get("displayName"):
+        return str(sku["displayName"])
+    product = item.get("product", {}) or {}
+    name = (
+        product.get("displayName")
+        or product.get("name")
+        or product.get("fullDisplayName")
+    )
+    return str(name) if name else None
+
+
 def _extract_price_from_cart_item(item: dict[str, Any]) -> float:
     """Extract price from a cart item.
 
     Prices can be in multiple locations depending on API response.
     """
+    # cartV2 (mobile bearer): item.itemPrice.{salePrice,listPrice,rawTotal}.amount
+    item_price = item.get("itemPrice")
+    if isinstance(item_price, dict):
+        for key in ("salePrice", "listPrice", "rawTotal", "adjustedTotal"):
+            dp = item_price.get(key)
+            if isinstance(dp, dict) and dp.get("amount") is not None:
+                return float(dp["amount"])
+
     # Primary: item.price.amount
     price_obj = item.get("price", {})
     if isinstance(price_obj, dict):
@@ -424,7 +447,7 @@ async def cart_get() -> dict[str, Any]:
             formatted_items.append({
                 "product_id": product.get("id"),
                 "sku_id": sku_id,
-                "name": product.get("displayName") or product.get("name"),
+                "name": _extract_name_from_cart_item(item),
                 "quantity": quantity,
                 "price": price,
                 "total": round(item_total, 2),
@@ -748,10 +771,9 @@ async def cart_add_many(
         for cart_item in cart_data.get("items", []):
             item_sku = _extract_sku_from_cart_item(cart_item)
             if item_sku:
-                product = cart_item.get("product", {})
                 items_after[item_sku] = {
                     "quantity": cart_item.get("quantity", 0),
-                    "name": product.get("displayName") or product.get("name"),
+                    "name": _extract_name_from_cart_item(cart_item),
                     "price": _extract_price_from_cart_item(cart_item),
                 }
 

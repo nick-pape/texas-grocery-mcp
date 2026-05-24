@@ -148,6 +148,16 @@ def is_authenticated() -> bool:
         return True
 
     settings = get_settings()
+
+    # Bearer (OAuth) mode: if tokens.json is present we're authenticated via the
+    # mobile bearer path — no reese84/cookies needed. The graphql client refreshes
+    # the access token per call (oauth.ensure_access_token). This is the durable,
+    # Incapsula-free path; it takes precedence over the legacy cookie/reese84 check.
+    from texas_grocery_mcp.auth.oauth import load_tokens
+
+    if load_tokens(settings.auth_state_path.parent) is not None:
+        return True
+
     auth_path = settings.auth_state_path
 
     if not auth_path.exists():
@@ -677,6 +687,14 @@ async def auto_refresh_session_if_needed() -> dict[str, Any] | None:
 
     # Check if auto-refresh is enabled
     if not settings.auto_refresh_enabled:
+        return None
+
+    # Bearer (OAuth) mode: the graphql client refreshes the access token per call
+    # (oauth.ensure_access_token) — a cheap HTTP refresh, no Playwright/reese84. So
+    # there's nothing to do here; skip the browser-refresh path entirely.
+    from texas_grocery_mcp.auth.oauth import load_tokens
+
+    if load_tokens(settings.auth_state_path.parent) is not None:
         return None
 
     # If the user has never logged in / saved storage state, don't block read-only tools.
