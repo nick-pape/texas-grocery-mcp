@@ -69,12 +69,23 @@ class StateManager:
 
     @staticmethod
     def get_default_store_id() -> str | None:
-        """Get the current default store ID."""
+        """Get the current default store ID.
+
+        Resolution: request-scoped override → runtime state (set by store tools) →
+        configured ``heb_default_store`` (HEB_DEFAULT_STORE). The config fallback
+        means a deployment with a configured store works out of the box — notably
+        the bearer path, where there's no web session to infer a store from.
+        """
         # Check request-scoped override first
         request_store = _request_store_id.get()
         if request_store is not None:
             return request_store
-        return cast(str | None, _shared_state["default_store_id"])
+        stored = cast(str | None, _shared_state["default_store_id"])
+        if stored is not None:
+            return stored
+        from texas_grocery_mcp.utils.config import get_settings
+
+        return get_settings().heb_default_store
 
     @staticmethod
     async def set_default_store_id(store_id: str | None) -> None:
