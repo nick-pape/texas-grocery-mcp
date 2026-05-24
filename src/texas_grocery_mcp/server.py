@@ -24,6 +24,7 @@ from texas_grocery_mcp.tools.coupon import (
     coupon_list,
     coupon_search,
 )
+from texas_grocery_mcp.tools.fulfillment import get_curbside_slots, reserve_curbside_slot
 from texas_grocery_mcp.tools.product import product_get, product_search, product_search_batch
 from texas_grocery_mcp.tools.session import (
     session_clear,
@@ -259,6 +260,10 @@ mcp.tool()(store_change)  # Changes store on HEB.com when authenticated, or sets
 mcp.tool(annotations={"readOnlyHint": True})(product_search)
 mcp.tool(annotations={"readOnlyHint": True})(product_search_batch)
 mcp.tool(annotations={"readOnlyHint": True})(product_get)
+
+# Register curbside checkout tools (mobile/bearer): list pickup slots + reserve one.
+mcp.tool(annotations={"readOnlyHint": True})(get_curbside_slots)
+mcp.tool(annotations={"destructiveHint": True})(reserve_curbside_slot)
 
 # Register coupon tools
 mcp.tool(annotations={"readOnlyHint": True})(coupon_list)

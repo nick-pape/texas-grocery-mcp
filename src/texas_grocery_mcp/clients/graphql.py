@@ -99,6 +99,14 @@ MOBILE_OPS: dict[str, tuple[str, str]] = {
         "ProductDetailsPage",
         "33606eddd452a659bdca241515df51d516ac5ec2d3904a147701f804b3e39bc3",
     ),
+    "listPickupTimeslotsV2": (
+        "listPickupTimeslotsV2",
+        "ad0fc3510d927e690693b64db501769e3fac7a572f34251d56f4f301f72f6b92",
+    ),
+    "ReserveTimeslot": (
+        "reserveTimeslotV3",
+        "97163d9114d723db8dce5ea76d5bf297955de3b0cb46baef426428f10917d2a6",
+    ),
 }
 # Shopping context used for mobile/bearer pricing + availability.
 MOBILE_SHOPPING_CONTEXT = "CURBSIDE_PICKUP"
@@ -2336,6 +2344,94 @@ class HEBGraphQLClient:
             availability_channels=sku.get("productAvailability") or [],
             is_snap_eligible=bool(item.get("isEbtSnapProduct", False)),
         )
+
+    async def get_curbside_slots(
+        self, store_id: str | None = None, days: int = 14
+    ) -> dict[str, Any]:
+        """Available curbside pickup timeslots via the mobile bearer API (no Incapsula)."""
+        sid_raw = store_id or get_settings().heb_default_store or "0"
+        try:
+            sid = int(str(sid_raw).strip())
+        except (TypeError, ValueError):
+            sid = 0
+        data = await self._execute_bearer_query(
+            "listPickupTimeslotsV2",
+            {"storeNumber": sid, "limit": 2147483647 if days > 0 else 14},
+        )
+        if data.get("error"):
+            return data
+        result = data.get("listPickupTimeslotsV2") or {}
+        if result.get("__typename") == "TimeslotsStandardErrorV2":
+            return {
+                "error": True,
+                "code": "SLOTS_ERROR",
+                "message": result.get("message", "Failed to fetch curbside slots"),
+            }
+        slots: list[dict[str, Any]] = []
+        for day in result.get("slotsByDay") or []:
+            for grp in day.get("slotsByGroup") or []:
+                for s in grp.get("slots") or []:
+                    full = s.get("isFull")
+                    if full is None:
+                        full = day.get("isFull")
+                    slots.append(
+                        {
+                            "slot_id": s.get("id"),
+                            "date": day.get("date"),
+                            "start_time": s.get("startTime") or s.get("start"),
+                            "end_time": s.get("endTime") or s.get("end"),
+                            "fee": (s.get("totalPrice") or {}).get("amount", 0),
+                            "available": True if full is None else (not full),
+                        }
+                    )
+        return {"slots": slots, "count": len(slots), "store_id": str(sid)}
+
+    async def reserve_curbside_slot(
+        self, slot_id: str, date: str, store_id: str | None = None
+    ) -> dict[str, Any]:
+        """Reserve (hold) a curbside pickup timeslot for the cart via bearer.
+
+        Soft commitment: holds the slot with a 'place your order by' deadline (no
+        payment is taken here). Returns the reservation id + expiry.
+        """
+        sid_raw = store_id or get_settings().heb_default_store or "0"
+        try:
+            sid = int(str(sid_raw).strip())
+        except (TypeError, ValueError):
+            sid = 0
+        data = await self._execute_bearer_query(
+            "ReserveTimeslot",
+            {
+                "fulfillmentPickup": {"pickupStoreId": str(sid)},
+                "fulfillmentType": "PICKUP",
+                "ignoreCartConflicts": False,
+                "includeTax": False,
+                "isAuthenticated": True,
+                "storeId": sid,
+                "timeslot": {"date": date, "id": slot_id},
+            },
+        )
+        if data.get("error"):
+            return data
+        result = data.get("reserveTimeslotV3") or {}
+        if result.get("__typename") == "ReserveTimeslotErrorV3":
+            return {
+                "error": True,
+                "code": "RESERVE_ERROR",
+                "message": result.get("message", "Failed to reserve slot"),
+            }
+        ts = result.get("timeslot") or {}
+        expires = ts.get("expiry") or ts.get("expiryDateTime")
+        return {
+            "success": True,
+            "reservation_id": result.get("id"),
+            "expires_at": expires,
+            "message": (
+                f"Reserved curbside slot; place your order by {expires} to keep it."
+                if expires
+                else "Reserved curbside slot."
+            ),
+        }
 
     async def get_cart(self) -> dict[str, Any]:
         """Get current cart contents.
