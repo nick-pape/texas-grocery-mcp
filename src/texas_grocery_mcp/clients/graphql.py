@@ -91,6 +91,10 @@ MOBILE_OPS: dict[str, tuple[str, str]] = {
         "ProductSearchPageV2",
         "a723225732e31edad1e7ab28f26177b57e7257c7f457b714d77951f56c85e63e",
     ),
+    "cartItemV2": (
+        "addItemToCartV2",
+        "ba00328429c15935088d93be84cc41b4f0032c388e8ccd11cd3ee5b8e7d77e41",
+    ),
 }
 # Shopping context used for mobile/bearer pricing + availability.
 MOBILE_SHOPPING_CONTEXT = "CURBSIDE_PICKUP"
@@ -2046,6 +2050,19 @@ class HEBGraphQLClient:
         Returns:
             Cart response data or error dict if not authenticated
         """
+        if self._bearer_available():
+            return await self._execute_bearer_query(
+                "cartItemV2",
+                {
+                    "includeTax": False,
+                    "isAuthenticated": True,
+                    "parentOrderId": None,
+                    "productId": product_id,
+                    "quantity": quantity,
+                    "skuId": sku_id,
+                },
+            )
+
         auth_client = await self._get_authenticated_client()
         if not auth_client:
             return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
