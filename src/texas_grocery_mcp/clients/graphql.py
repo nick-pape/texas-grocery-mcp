@@ -107,6 +107,14 @@ MOBILE_OPS: dict[str, tuple[str, str]] = {
         "reserveTimeslotV3",
         "97163d9114d723db8dce5ea76d5bf297955de3b0cb46baef426428f10917d2a6",
     ),
+    "orderHistory": (
+        "orderHistory",
+        "24c9d9f68669313a33d559f8a1c86360125af36533d28725b2e7c955ab5b5619",
+    ),
+    "orderDetails": (
+        "orderDetails",
+        "bd1ba9beb2e4af8a4099965d1b4ce455d28532e8b727d490f3a7df6486d5508f",
+    ),
 }
 # Shopping context used for mobile/bearer pricing + availability.
 MOBILE_SHOPPING_CONTEXT = "CURBSIDE_PICKUP"
@@ -2298,13 +2306,10 @@ class HEBGraphQLClient:
             skus[0] if skus else {},
         )
         ctx_prices = sku.get("contextPrices") or []
-        cur = (
-            next(
-                (p for p in ctx_prices if p.get("context") in ("CURBSIDE_PICKUP", "CURBSIDE")),
-                None,
-            )
-            or (ctx_prices[0] if ctx_prices else {})
-        )
+        cur = next(
+            (p for p in ctx_prices if p.get("context") in ("CURBSIDE_PICKUP", "CURBSIDE")),
+            None,
+        ) or (ctx_prices[0] if ctx_prices else {})
         cur_price = cur.get("salePrice") or cur.get("listPrice") or {}
         unit = cur.get("unitSalePrice") or cur.get("unitListPrice") or {}
         online = next((p for p in ctx_prices if p.get("context") == "ONLINE"), None)
@@ -2431,6 +2436,140 @@ class HEBGraphQLClient:
                 if expires
                 else "Reserved curbside slot."
             ),
+        }
+
+    @staticmethod
+    def _as_dict(value: Any) -> dict[str, Any]:
+        """Return value if it's a dict, else {} (narrows Any|None for safe .get())."""
+        return value if isinstance(value, dict) else {}
+
+    @classmethod
+    def _extract_history_orders(cls, data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Pull the orders array out of an orderHistory response.
+
+        The mobile API nests it inconsistently, so mirror the SDK's defensive walk
+        (orderHistoryRequest|orderHistory -> .orderHistory|self -> .orders|root.orders).
+        """
+        req = cls._as_dict(data.get("orderHistoryRequest") or data.get("orderHistory"))
+        inner = cls._as_dict(req.get("orderHistory")) or req
+        orders = inner.get("orders") or req.get("orders") or data.get("orders")
+        return orders if isinstance(orders, list) else []
+
+    @classmethod
+    def _map_history_order(cls, order: dict[str, Any]) -> dict[str, Any]:
+        """Normalize one order from the history list to a flat dict."""
+        price = cls._as_dict(order.get("totalPrice"))
+        details = cls._as_dict(order.get("priceDetails"))
+        total = (
+            price.get("formattedAmount")
+            or cls._as_dict(details.get("total")).get("formattedAmount")
+            or cls._as_dict(order.get("grandTotal")).get("formattedAmount")
+        )
+        slot = cls._as_dict(order.get("orderTimeslot"))
+        store = cls._as_dict(order.get("store"))
+        return {
+            "order_id": order.get("orderId"),
+            "status": order.get("status") or order.get("orderStatusMessageShort"),
+            "fulfillment_type": order.get("fulfillmentType"),
+            "store": store.get("name"),
+            "date": slot.get("formattedDate") or slot.get("startTime") or slot.get("startDateTime"),
+            "start_time": slot.get("startTime") or slot.get("startDateTime"),
+            "end_time": slot.get("endTime") or slot.get("endDateTime"),
+            "total": total,
+            "item_count": order.get("productCount"),
+        }
+
+    async def get_order_history(self, status: str | None = None, limit: int = 10) -> dict[str, Any]:
+        """Past + active orders via the mobile bearer API (no Incapsula).
+
+        Fetches ACTIVE and COMPLETED orders (or a single ``status`` if given), merges +
+        dedupes by order id. Bearer-only (the order ops live on the mobile API).
+        """
+        if not self._bearer_available():
+            return {
+                "error": True,
+                "code": "NOT_AUTHENTICATED",
+                "message": "Order history requires a logged-in (bearer) session.",
+                "orders": [],
+                "count": 0,
+            }
+        mode = "CURBSIDE" if "CURBSIDE" in MOBILE_SHOPPING_CONTEXT else "ONLINE"
+        size = max(1, limit)
+        statuses = [status.upper()] if status else ["ACTIVE", "COMPLETED"]
+        merged: dict[str, dict[str, Any]] = {}
+        for st in statuses:
+            data = await self._execute_bearer_query(
+                "orderHistory",
+                {"mode": mode, "offset": 0, "omitOrderItems": False, "size": size, "status": st},
+            )
+            if data.get("error"):
+                return data
+            for raw in self._extract_history_orders(data):
+                oid = raw.get("orderId")
+                if oid and oid not in merged:
+                    merged[oid] = self._map_history_order(raw)
+        orders = list(merged.values())[:limit] if status is None else list(merged.values())
+        return {"orders": orders, "count": len(orders)}
+
+    async def get_order_details(self, order_id: str) -> dict[str, Any]:
+        """Full detail (line items + totals) for one order via the mobile bearer API."""
+        if not self._bearer_available():
+            return {
+                "error": True,
+                "code": "NOT_AUTHENTICATED",
+                "message": "Order details require a logged-in (bearer) session.",
+            }
+        data = await self._execute_bearer_query(
+            "orderDetails", {"orderId": order_id, "includeReadyOrder": True}
+        )
+        if data.get("error"):
+            return data
+        order = data.get("orderDetails")
+        if not isinstance(order, dict):
+            order = self._as_dict(data.get("orderDetailsRequest")).get("order")
+        if not isinstance(order, dict):
+            return {
+                "error": True,
+                "code": "NOT_FOUND",
+                "message": f"Order {order_id} not found.",
+            }
+        details = self._as_dict(order.get("priceDetails"))
+        total_obj = self._as_dict(order.get("totalPrice"))
+        total = self._as_dict(details.get("total")).get("formattedAmount") or total_obj.get(
+            "formattedAmount"
+        )
+        slot = self._as_dict(order.get("orderTimeslot"))
+        store = self._as_dict(order.get("store"))
+        items: list[dict[str, Any]] = []
+        for it in order.get("orderItems") or []:
+            product = self._as_dict(it.get("product"))
+            price_obj = self._as_dict(it.get("totalUnitPrice") or it.get("unitPrice"))
+            items.append(
+                {
+                    "name": product.get("fullDisplayName")
+                    or product.get("displayName")
+                    or product.get("name"),
+                    "product_id": product.get("id"),
+                    "quantity": it.get("quantity"),
+                    "price": price_obj.get("formattedAmount"),
+                }
+            )
+        return {
+            "order_id": order.get("orderId") or order_id,
+            "status": order.get("status") or order.get("orderStatusMessageShort"),
+            "fulfillment_type": order.get("fulfillmentType"),
+            "placed_at": order.get("orderPlacedOnDateTime") or order.get("orderPlacedOn"),
+            "store": store.get("name"),
+            "timeslot": {
+                "date": slot.get("formattedDate"),
+                "start_time": slot.get("startTime") or slot.get("startDateTime"),
+                "end_time": slot.get("endTime") or slot.get("endDateTime"),
+            },
+            "subtotal": self._as_dict(details.get("subtotal")).get("formattedAmount"),
+            "tax": self._as_dict(details.get("tax")).get("formattedAmount"),
+            "total": total,
+            "items": items,
+            "item_count": len(items),
         }
 
     async def get_cart(self) -> dict[str, Any]:

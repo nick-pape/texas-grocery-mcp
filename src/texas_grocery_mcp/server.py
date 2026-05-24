@@ -25,6 +25,7 @@ from texas_grocery_mcp.tools.coupon import (
     coupon_search,
 )
 from texas_grocery_mcp.tools.fulfillment import get_curbside_slots, reserve_curbside_slot
+from texas_grocery_mcp.tools.orders import get_order_details, get_order_history
 from texas_grocery_mcp.tools.product import product_get, product_search, product_search_batch
 from texas_grocery_mcp.tools.session import (
     session_clear,
@@ -185,6 +186,7 @@ async def lifespan(app: FastMCP) -> AsyncIterator[None]:
             await keepwarm_task
     logger.info("MCP server shutting down")
 
+
 MCP_INSTRUCTIONS = """
 ## Texas Grocery MCP - Session Management
 
@@ -264,6 +266,10 @@ mcp.tool(annotations={"readOnlyHint": True})(product_get)
 # Register curbside checkout tools (mobile/bearer): list pickup slots + reserve one.
 mcp.tool(annotations={"readOnlyHint": True})(get_curbside_slots)
 mcp.tool(annotations={"destructiveHint": True})(reserve_curbside_slot)
+
+# Register order history tools (mobile/bearer, read-only): past/active orders + detail.
+mcp.tool(annotations={"readOnlyHint": True})(get_order_history)
+mcp.tool(annotations={"readOnlyHint": True})(get_order_details)
 
 # Register coupon tools
 mcp.tool(annotations={"readOnlyHint": True})(coupon_list)

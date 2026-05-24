@@ -539,3 +539,116 @@ async def test_select_store_handles_invalid_store_id():
         # Should report INVALID_STORE_ID error
         assert result.get("error") is True
         assert result.get("code") == "INVALID_STORE_ID"
+
+
+# --- order history (mobile/bearer) ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_order_history_maps_and_dedupes(client, monkeypatch):
+    """Should merge ACTIVE+COMPLETED, dedupe by orderId, and flatten each order."""
+    from unittest.mock import AsyncMock
+
+    history_data = {
+        "orderHistory": {
+            "orders": [
+                {
+                    "orderId": "HEB123",
+                    "status": "COMPLETED",
+                    "fulfillmentType": "PICKUP",
+                    "store": {"name": "Leander H-E-B"},
+                    "orderTimeslot": {
+                        "startTime": "2026-05-20T12:00:00Z",
+                        "endTime": "2026-05-20T12:30:00Z",
+                        "formattedDate": "May 20",
+                    },
+                    "totalPrice": {"formattedAmount": "$42.50"},
+                    "productCount": 7,
+                }
+            ]
+        }
+    }
+    monkeypatch.setattr(client, "_bearer_available", lambda: True)
+    # Same payload for both status calls -> dedupe to a single order.
+    monkeypatch.setattr(client, "_execute_bearer_query", AsyncMock(return_value=history_data))
+
+    result = await client.get_order_history()
+
+    assert result["count"] == 1
+    order = result["orders"][0]
+    assert order["order_id"] == "HEB123"
+    assert order["status"] == "COMPLETED"
+    assert order["store"] == "Leander H-E-B"
+    assert order["total"] == "$42.50"
+    assert order["item_count"] == 7
+    assert order["date"] == "May 20"
+
+
+@pytest.mark.asyncio
+async def test_get_order_history_requires_bearer(client, monkeypatch):
+    """Without bearer tokens it returns an honest auth error, not a crash."""
+    monkeypatch.setattr(client, "_bearer_available", lambda: False)
+    result = await client.get_order_history()
+    assert result["error"] is True
+    assert result["code"] == "NOT_AUTHENTICATED"
+    assert result["orders"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_order_details_maps_items_and_totals(client, monkeypatch):
+    """Should flatten line items + subtotal/tax/total from orderDetails."""
+    from unittest.mock import AsyncMock
+
+    details_data = {
+        "orderDetails": {
+            "orderId": "HEB123",
+            "status": "COMPLETED",
+            "fulfillmentType": "PICKUP",
+            "orderPlacedOnDateTime": "2026-05-19T10:00:00Z",
+            "store": {"name": "Leander H-E-B"},
+            "orderTimeslot": {
+                "startDateTime": "2026-05-20T12:00:00Z",
+                "endDateTime": "2026-05-20T12:30:00Z",
+                "formattedDate": "May 20",
+            },
+            "priceDetails": {
+                "subtotal": {"formattedAmount": "$40.00"},
+                "tax": {"formattedAmount": "$2.50"},
+                "total": {"formattedAmount": "$42.50"},
+            },
+            "orderItems": [
+                {
+                    "quantity": 2,
+                    "product": {"id": "p1", "fullDisplayName": "H-E-B Whole Milk"},
+                    "totalUnitPrice": {"amount": 8.62, "formattedAmount": "$8.62"},
+                }
+            ],
+        }
+    }
+    monkeypatch.setattr(client, "_bearer_available", lambda: True)
+    monkeypatch.setattr(client, "_execute_bearer_query", AsyncMock(return_value=details_data))
+
+    result = await client.get_order_details("HEB123")
+
+    assert result["order_id"] == "HEB123"
+    assert result["subtotal"] == "$40.00"
+    assert result["tax"] == "$2.50"
+    assert result["total"] == "$42.50"
+    assert result["item_count"] == 1
+    item = result["items"][0]
+    assert item["name"] == "H-E-B Whole Milk"
+    assert item["product_id"] == "p1"
+    assert item["quantity"] == 2
+    assert item["price"] == "$8.62"
+
+
+@pytest.mark.asyncio
+async def test_get_order_details_not_found(client, monkeypatch):
+    """An empty/missing order object yields a NOT_FOUND error."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(client, "_bearer_available", lambda: True)
+    monkeypatch.setattr(client, "_execute_bearer_query", AsyncMock(return_value={}))
+    result = await client.get_order_details("HEBZZZ")
+    assert result["error"] is True
+    assert result["code"] == "NOT_FOUND"
