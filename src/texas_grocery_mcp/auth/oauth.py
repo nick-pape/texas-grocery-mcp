@@ -26,10 +26,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import os
 import secrets
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -147,3 +152,88 @@ def refresh_tokens(refresh_token: str) -> dict[str, Any]:
 
 class OAuthError(Exception):
     """An HEB OIDC token-endpoint error."""
+
+
+# --- token store (the bearer "session"): tokens.json on the auth volume --------
+
+TOKENS_FILENAME = "tokens.json"
+# Refresh when the access token has less than this many seconds left.
+_REFRESH_SKEW_S = 120
+
+
+def tokens_path(auth_dir: Path) -> Path:
+    return Path(auth_dir).expanduser() / TOKENS_FILENAME
+
+
+def load_tokens(auth_dir: Path) -> dict[str, Any] | None:
+    p = tokens_path(auth_dir)
+    if not p.exists():
+        return None
+    try:
+        data: dict[str, Any] = json.loads(p.read_text(encoding="utf-8"))
+        return data if data.get("access_token") else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_tokens(auth_dir: Path, tokens: dict[str, Any]) -> None:
+    """Write tokens.json atomically, mode 0600 (contains a bearer + refresh token)."""
+    p = tokens_path(auth_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.parent / f".tokens.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(tokens, indent=2), encoding="utf-8")
+    with suppress(OSError):
+        os.chmod(tmp, 0o600)
+    try:
+        os.replace(tmp, p)
+    except OSError:
+        # Bind-mounted single file (Docker) can't be replaced via rename — overwrite.
+        p.write_text(json.dumps(tokens, indent=2), encoding="utf-8")
+        with suppress(OSError):
+            tmp.unlink()
+
+
+def _expires_at_epoch(tokens: dict[str, Any]) -> float:
+    """Best-effort access-token expiry as epoch seconds."""
+    ea = tokens.get("expires_at")
+    if isinstance(ea, str):
+        try:
+            return datetime.fromisoformat(ea.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    # Fall back to obtained_at + expires_in (default 30 min from now if unknown).
+    obtained = float(tokens.get("obtained_at", 0) or 0)
+    expires_in = float(tokens.get("expires_in", 1800) or 1800)
+    return (obtained or time.time()) + expires_in
+
+
+def ensure_access_token(auth_dir: Path) -> str | None:
+    """Return a valid bearer access token, refreshing + persisting if near expiry.
+
+    This is the bearer-session equivalent of the old reese84 keep-alive — but it's a
+    cheap HTTP refresh against accounts.heb.com (no browser, no Incapsula). Returns
+    None if there's no token file / refresh fails (caller treats as unauthenticated).
+    """
+    tokens = load_tokens(auth_dir)
+    if not tokens:
+        return None
+    if _expires_at_epoch(tokens) - time.time() > _REFRESH_SKEW_S:
+        access: str = tokens["access_token"]
+        return access
+    rt = tokens.get("refresh_token")
+    if not rt:
+        return tokens.get("access_token")  # can't refresh; try the (maybe stale) token
+    try:
+        fresh = refresh_tokens(rt)
+    except OAuthError:
+        return tokens.get("access_token")
+    # Merge + stamp, preserving any fields HEB omits on refresh (e.g. refresh_token).
+    tokens.update({k: v for k, v in fresh.items() if v})
+    now = time.time()
+    tokens["obtained_at"] = now
+    exp = datetime.fromtimestamp(
+        now + float(fresh.get("expires_in", 1800) or 1800), tz=UTC
+    )
+    tokens["expires_at"] = exp.isoformat().replace("+00:00", "Z")
+    save_tokens(auth_dir, tokens)
+    return tokens.get("access_token")
