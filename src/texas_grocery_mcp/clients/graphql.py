@@ -95,6 +95,10 @@ MOBILE_OPS: dict[str, tuple[str, str]] = {
         "addItemToCartV2",
         "ba00328429c15935088d93be84cc41b4f0032c388e8ccd11cd3ee5b8e7d77e41",
     ),
+    "productDetailsPage": (
+        "ProductDetailsPage",
+        "33606eddd452a659bdca241515df51d516ac5ec2d3904a147701f804b3e39bc3",
+    ),
 }
 # Shopping context used for mobile/bearer pricing + availability.
 MOBILE_SHOPPING_CONTEXT = "CURBSIDE_PICKUP"
@@ -1442,6 +1446,13 @@ class HEBGraphQLClient:
             )
             return cached
 
+        # Durable OAuth bearer path (mobile API, no Incapsula) when tokens present.
+        if self._bearer_available():
+            details = await self._product_details_bearer(product_id, store_id)
+            if details:
+                self._product_details_cache.set(cache_key, details)
+            return details
+
         # Pre-fetch build ID before getting auth client
         # (prevents client lifecycle issues since _get_build_id may create a client)
         await self._get_build_id()
@@ -2233,6 +2244,97 @@ class HEBGraphQLClient:
             query=query,
             store_id=store_id,
             data_source="bearer",
+        )
+
+    async def _product_details_bearer(
+        self, product_id: str, store_id: str | None
+    ) -> ProductDetails | None:
+        """Product details via the mobile bearer API (no Incapsula)."""
+        sid_raw = store_id or get_settings().heb_default_store or "0"
+        try:
+            sid = int(str(sid_raw).strip())
+        except (TypeError, ValueError):
+            sid = 0
+        data = await self._execute_bearer_query(
+            "productDetailsPage",
+            {
+                "id": product_id,
+                "isAuthenticated": True,
+                "shoppingContext": MOBILE_SHOPPING_CONTEXT,
+                "storeId": str(sid),
+                "storeIdInt": sid,
+            },
+        )
+        if data.get("error"):
+            return None
+        product = (data.get("productDetailsPage") or {}).get("product")
+        if not isinstance(product, dict):
+            return None
+        return self._build_product_details(product, sid, fallback_id=product_id)
+
+    def _build_product_details(
+        self, item: dict[str, Any], store_id: int, fallback_id: str = ""
+    ) -> ProductDetails:
+        """Map a mobile product to our ProductDetails (core fields; rich nutrition
+        parsing deferred — left None)."""
+        skus = item.get("skus") or []
+        sku = next(
+            (
+                s
+                for s in skus
+                if any(
+                    a in (s.get("productAvailability") or [])
+                    for a in ("CURBSIDE_PICKUP", "DELIVERY")
+                )
+            ),
+            skus[0] if skus else {},
+        )
+        ctx_prices = sku.get("contextPrices") or []
+        cur = (
+            next(
+                (p for p in ctx_prices if p.get("context") in ("CURBSIDE_PICKUP", "CURBSIDE")),
+                None,
+            )
+            or (ctx_prices[0] if ctx_prices else {})
+        )
+        cur_price = cur.get("salePrice") or cur.get("listPrice") or {}
+        unit = cur.get("unitSalePrice") or cur.get("unitListPrice") or {}
+        online = next((p for p in ctx_prices if p.get("context") == "ONLINE"), None)
+        price_online: float | None = None
+        if online:
+            op = online.get("salePrice") or online.get("listPrice") or {}
+            if isinstance(op, dict) and op.get("amount") is not None:
+                price_online = float(op["amount"])
+        brand_obj = item.get("brand")
+        brand_name = brand_obj.get("name") if isinstance(brand_obj, dict) else None
+        is_own = bool(brand_obj.get("isOwnBrand", False)) if isinstance(brand_obj, dict) else False
+        cat_obj = item.get("productCategory")
+        cat_name = cat_obj.get("name") if isinstance(cat_obj, dict) else None
+        images = item.get("carouselImageUrls") or []
+        desc = item.get("productDescription")
+        if isinstance(desc, str):
+            desc = re.sub(r"<[^>]+>", "", desc).strip() or None
+        return ProductDetails(
+            product_id=str(item.get("productId") or fallback_id or ""),
+            sku=str(sku.get("id") or item.get("productId") or fallback_id or ""),
+            name=item.get("displayName") or "",
+            description=desc,
+            brand=brand_name,
+            is_own_brand=is_own,
+            price=float(cur_price.get("amount") or 0.0),
+            price_online=price_online,
+            on_sale=bool(cur.get("isOnSale", False)),
+            is_price_cut=bool(cur.get("isPriceCut", False)),
+            available=bool(item.get("isAvailableForCheckout", True)),
+            price_per_unit=unit.get("formattedAmount") or None,
+            size=sku.get("customerFriendlySize"),
+            ingredients=item.get("ingredientStatement") or None,
+            image_url=images[0] if images else None,
+            images=images,
+            category_path=[cat_name] if cat_name else [],
+            store_id=store_id or None,
+            availability_channels=sku.get("productAvailability") or [],
+            is_snap_eligible=bool(item.get("isEbtSnapProduct", False)),
         )
 
     async def get_cart(self) -> dict[str, Any]:
