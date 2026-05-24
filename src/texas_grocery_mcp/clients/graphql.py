@@ -75,6 +75,21 @@ DEFAULT_PERSISTED_QUERIES = {
 }
 
 
+# --- Mobile (bearer) GraphQL — the durable, Incapsula-free path ----------------
+# When OAuth bearer tokens are present (tokens.json on the auth volume), operations
+# go to HEB's MOBILE API edge with a Bearer token instead of www.heb.com + reese84
+# cookies. That host has no Incapsula challenge, so it works regardless of anti-bot
+# heat. Mobile persisted-query hashes are back-compat-stable (HEB can't break old app
+# installs), so we hardcode them (from iHildy/heb-sdk-unofficial). See
+# auth/oauth.py + ~/.claude/plans/heb-oauth-pkce-adoption.md.
+MOBILE_GRAPHQL_ENDPOINT = "https://api-edge.heb-ecom-api.hebdigital-prd.com/graphql"
+MOBILE_USER_AGENT = "MyHEB/5.9.0.60733 (iOS 18.7.2; iPhone16,2) CFNetwork/1.0 Darwin/24.6.0"
+# web operation name -> (mobile operation name, mobile sha256 hash)
+MOBILE_OPS: dict[str, tuple[str, str]] = {
+    "cartEstimated": ("cartV2", "d57a76ebe19efdb3a06323afa65eb176a1c92e478ab9916742fba3cb2cc9f075"),
+}
+
+
 class HashStore:
     """Mutable registry of persisted-query hashes with on-disk override cache.
 
@@ -249,6 +264,7 @@ class HEBGraphQLClient:
         self.circuit_breaker = CircuitBreaker("heb_api")
         self._client: httpx.AsyncClient | None = None
         self._auth_client: httpx.AsyncClient | None = None
+        self._bearer_client: httpx.AsyncClient | None = None
         self._build_id: str | None = None
 
         # Initialize throttlers for rate limiting
@@ -326,6 +342,9 @@ class HEBGraphQLClient:
         if self._auth_client:
             await self._auth_client.aclose()
             self._auth_client = None
+        if self._bearer_client:
+            await self._bearer_client.aclose()
+            self._bearer_client = None
 
     async def _get_build_id(self) -> str:
         """Extract Next.js build ID from HEB homepage.
@@ -2032,14 +2051,81 @@ class HEBGraphQLClient:
             },
         )
 
-    async def get_cart(self) -> dict[str, Any]:
-        """Get current cart contents using authenticated GraphQL.
+    def _bearer_available(self) -> bool:
+        """True if OAuth bearer tokens exist (the durable, Incapsula-free path)."""
+        from texas_grocery_mcp.auth.oauth import load_tokens
 
-        Requires authentication cookies to be available.
+        return load_tokens(get_settings().auth_state_path.parent) is not None
+
+    async def _get_bearer_client(self) -> httpx.AsyncClient:
+        if self._bearer_client is None:
+            self._bearer_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0), follow_redirects=True
+            )
+        return self._bearer_client
+
+    async def _execute_bearer_query(
+        self, web_operation: str, variables: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Run a persisted query against the MOBILE bearer endpoint (no Incapsula).
+
+        Maps the web operation name to its mobile equivalent + hash, attaches a fresh
+        Bearer token (refreshed as needed), and returns the raw GraphQL ``data`` dict
+        — same contract as the cookie/web path, so tools are unchanged.
+        """
+        from texas_grocery_mcp.auth.oauth import ensure_access_token
+
+        mobile = MOBILE_OPS.get(web_operation)
+        if mobile is None:
+            raise ValueError(f"No mobile mapping for operation: {web_operation}")
+        mobile_op, mobile_hash = mobile
+        token = ensure_access_token(get_settings().auth_state_path.parent)
+        if not token:
+            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
+
+        payload = {
+            "operationName": mobile_op,
+            "variables": variables,
+            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": mobile_hash}},
+        }
+        client = await self._get_bearer_client()
+        self.circuit_breaker.check()
+        try:
+            resp = await client.post(
+                MOBILE_GRAPHQL_ENDPOINT,
+                json=payload,
+                headers={
+                    "authorization": f"Bearer {token}",
+                    "content-type": "application/json",
+                    "user-agent": MOBILE_USER_AGENT,
+                },
+            )
+            resp.raise_for_status()
+            data: Any = resp.json()
+            if isinstance(data, dict) and data.get("errors"):
+                raise GraphQLError(data["errors"])
+            self.circuit_breaker.record_success()
+            payload_data = data.get("data") if isinstance(data, dict) else None
+            return cast(dict[str, Any], payload_data) if isinstance(payload_data, dict) else {}
+        except (httpx.HTTPError, GraphQLError) as e:
+            self.circuit_breaker.record_failure()
+            logger.error("bearer query failed", operation=mobile_op, error=str(e))
+            raise
+
+    async def get_cart(self) -> dict[str, Any]:
+        """Get current cart contents.
+
+        Prefers the durable OAuth bearer/mobile path (no Incapsula) when tokens are
+        present; falls back to the cookie/web path otherwise.
 
         Returns:
-            Cart data or error dict if not authenticated
+            Cart data (raw GraphQL ``data``, with a ``cartV2`` key) or error dict.
         """
+        if self._bearer_available():
+            return await self._execute_bearer_query(
+                "cartEstimated", {"includeTax": False, "isAuthenticated": True}
+            )
+
         auth_client = await self._get_authenticated_client()
         if not auth_client:
             return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
