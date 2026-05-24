@@ -48,47 +48,62 @@ logger = structlog.get_logger()
 
 async def _reese84_keepwarm_loop(interval_s: int) -> None:
     """Background task: proactively renew reese84 so the session stays warm while
-    idle, instead of relying solely on the lazy ensure_session refresh before
-    each tool call. Refreshes once shortly after startup (so the MCP is in a good
-    state immediately, not waiting for the first tool call), then every
-    ``interval_s`` seconds; failures are logged and retried next cycle (never
-    crash the server).
+    idle, instead of relying solely on the lazy ensure_session refresh before each
+    tool call. Refreshes once shortly after startup (so the MCP is in a good state
+    immediately), then every ``interval_s`` seconds.
+
+    ADAPTIVE BACKOFF (critical): HEB's Incapsula anti-bot flags accounts that get
+    hammered — once it's hot it returns HTTP 401 to the headless refresh, and
+    refreshing on a FIXED cadence into a hot account keeps it hot and prolongs the
+    lockout (we caused exactly this during testing). So on any refresh failure we
+    back off exponentially (up to ~1h) to let the account cool, and reset to the
+    base cadence once a refresh succeeds. A well-behaved client must self-cool, not
+    self-cook. The lazy ensure_session refresh still serves on-demand tool calls,
+    and a real-Chrome re-capture revives a fully-cooled-but-expired session.
+    Never crashes the server.
     """
     from texas_grocery_mcp.auth.browser_refresh import (
-        BrowserRefreshError,
-        LoginRequiredError,
         is_playwright_available,
         refresh_session_with_browser,
     )
 
     settings = get_settings()
-    # Refresh shortly after startup so the MCP gets itself into a good state right
-    # away (don't sit idle waiting for a tool call to lazily refresh), then every
-    # interval_s. A short initial delay lets the server finish coming up first.
-    # This runs as a background task, so it never blocks startup either way.
+    base = interval_s
+    cap = max(3600, base)  # max cool-off between attempts when hot (~1h)
+    failures = 0
+    # Short initial delay so the server finishes coming up; then refresh each
+    # iteration (immediate first cycle = good state right away). Background task,
+    # never blocks startup.
     await asyncio.sleep(5)
     while True:
+        delay = base
         try:
             auth_path = settings.auth_state_path
-            if auth_path.exists() and is_playwright_available():
+            if not auth_path.exists() or not is_playwright_available():
+                failures = 0  # nothing to do — not a failure, don't back off
+            else:
                 result = await refresh_session_with_browser(
                     auth_path=auth_path, headless=True, timeout=30000
                 )
+                failures = 0
                 logger.info(
                     "keepwarm: reese84 refreshed",
                     elapsed_seconds=result.get("elapsed_seconds"),
                 )
         except asyncio.CancelledError:
             raise
-        except LoginRequiredError:
-            logger.warning(
-                "keepwarm: session fully expired — manual re-capture needed; skipping"
-            )
-        except BrowserRefreshError as e:
-            logger.warning("keepwarm: refresh failed; will retry next cycle", error=str(e))
         except Exception as e:  # noqa: BLE001 - keep-warm must never crash the server
-            logger.warning("keepwarm: unexpected error", error=str(e))
-        await asyncio.sleep(interval_s)
+            # Includes LoginRequiredError / BrowserRefreshError (e.g. HTTP 401 when
+            # the account is hot). Back off so we stop feeding the anti-bot flag.
+            failures += 1
+            delay = min(base * 2**failures, cap)
+            logger.warning(
+                "keepwarm: refresh failed; backing off to let the account cool",
+                error=str(e),
+                consecutive_failures=failures,
+                next_retry_s=delay,
+            )
+        await asyncio.sleep(delay)
 
 
 @asynccontextmanager

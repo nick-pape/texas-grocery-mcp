@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automated browser).
 
 ### Fixed
+- **Keep-warm now backs off when the account is hot (self-cool, not self-cook):**
+  HEB's Incapsula flags accounts that get hammered — once hot it returns HTTP 401
+  to the headless refresh, and refreshing on a FIXED cadence into a hot account
+  keeps it hot and prolongs the lockout. The keep-warm loop now backs off
+  exponentially on any refresh failure (up to ~1h) to let the account cool, and
+  resets to the base cadence once a refresh succeeds. The lazy `ensure_session`
+  refresh still serves on-demand tool calls; a real-Chrome re-capture revives a
+  fully-cooled-but-expired session. This is what keeps the session healthy *over
+  time* instead of the proactive refresher becoming the thing that breaks it.
 - **Refresh now retries with a reload before giving up:** HEB's Incapsula reese84
   renewal is probabilistic under anti-bot heat — a given page load may not issue a
   fresh token, but a reload frequently does. The headless refresh now loads, polls
