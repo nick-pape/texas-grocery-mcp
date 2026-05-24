@@ -236,7 +236,7 @@ class ProductSearchResult(BaseModel):
     store_id: str = Field(description="Store ID used for search")
 
     # Data source tracking
-    data_source: Literal["ssr", "playwright", "typeahead_suggestions"] = Field(
+    data_source: Literal["ssr", "playwright", "typeahead_suggestions", "bearer"] = Field(
         description="Source of the product data"
     )
     authenticated: bool = Field(

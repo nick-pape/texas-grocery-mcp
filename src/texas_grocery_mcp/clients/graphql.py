@@ -87,7 +87,13 @@ MOBILE_USER_AGENT = "MyHEB/5.9.0.60733 (iOS 18.7.2; iPhone16,2) CFNetwork/1.0 Da
 # web operation name -> (mobile operation name, mobile sha256 hash)
 MOBILE_OPS: dict[str, tuple[str, str]] = {
     "cartEstimated": ("cartV2", "d57a76ebe19efdb3a06323afa65eb176a1c92e478ab9916742fba3cb2cc9f075"),
+    "productSearchPageV2": (
+        "ProductSearchPageV2",
+        "a723225732e31edad1e7ab28f26177b57e7257c7f457b714d77951f56c85e63e",
+    ),
 }
+# Shopping context used for mobile/bearer pricing + availability.
+MOBILE_SHOPPING_CONTEXT = "CURBSIDE_PICKUP"
 
 
 class HashStore:
@@ -1163,6 +1169,10 @@ class HEBGraphQLClient:
         security_challenge_detected = False
         search_url = f"https://www.heb.com/search?q={query.replace(' ', '+')}"
 
+        # Durable OAuth bearer path (mobile API, no Incapsula) when tokens are present.
+        if self._bearer_available():
+            return await self._search_products_bearer(query, store_id, limit)
+
         # Try authenticated search first
         auth_client = await self._get_authenticated_client()
         if auth_client:
@@ -2111,6 +2121,102 @@ class HEBGraphQLClient:
             self.circuit_breaker.record_failure()
             logger.error("bearer query failed", operation=mobile_op, error=str(e))
             raise
+
+    def _map_mobile_product(self, item: dict[str, Any]) -> Product:
+        """Map a mobile (bearer) product to our Product model (mirrors the SDK's
+        mapMobileProduct: pick the curbside/delivery SKU, resolve sale→list price)."""
+        skus = item.get("skus") or []
+        sku = next(
+            (
+                s
+                for s in skus
+                if any(
+                    a in (s.get("productAvailability") or [])
+                    for a in ("CURBSIDE_PICKUP", "DELIVERY")
+                )
+            ),
+            skus[0] if skus else {},
+        )
+        ctx_prices = sku.get("contextPrices") or []
+        price_ctx = (
+            next(
+                (p for p in ctx_prices if p.get("context") in ("CURBSIDE_PICKUP", "CURBSIDE")),
+                None,
+            )
+            or next((p for p in ctx_prices if p.get("context") == "ONLINE"), None)
+            or (ctx_prices[0] if ctx_prices else {})
+        )
+        price_obj = price_ctx.get("salePrice") or price_ctx.get("listPrice") or {}
+        unit_obj = price_ctx.get("unitSalePrice") or price_ctx.get("unitListPrice") or {}
+        brand_obj = item.get("brand")
+        brand_name = brand_obj.get("name") if isinstance(brand_obj, dict) else None
+        images = item.get("carouselImageUrls") or []
+        return Product(
+            sku=str(sku.get("id") or item.get("productId") or ""),
+            product_id=str(item["productId"]) if item.get("productId") else None,
+            name=item.get("displayName") or "",
+            price=float(price_obj.get("amount") or 0.0),
+            available=bool(item.get("isAvailableForCheckout", True)),
+            brand=brand_name,
+            size=sku.get("customerFriendlySize"),
+            price_per_unit=unit_obj.get("formattedAmount") or None,
+            image_url=images[0] if images else None,
+            has_coupon=bool(item.get("showCouponFlag", False)),
+        )
+
+    async def _search_products_bearer(
+        self, query: str, store_id: str, limit: int
+    ) -> ProductSearchResult:
+        """Product search via the mobile bearer API (no Incapsula)."""
+        try:
+            sid = int(str(store_id).strip())
+        except (TypeError, ValueError):
+            sid = 0
+        sc = MOBILE_SHOPPING_CONTEXT
+        variables = {
+            "isAuthenticated": True,
+            "params": {
+                "doNotSuggestPhrase": False,
+                "pageSize": max(50, limit),
+                "query": query,
+                "shoppingContext": sc,
+                "storeId": sid,
+            },
+            "searchMode": "MAIN_SEARCH",
+            "searchPageLayout": "MOBILE_SEARCH_PAGE_LAYOUT",
+            "shoppingContext": sc,
+            "storeId": sid,
+            "storeIdID": str(sid),
+            "storeIdString": str(sid),
+        }
+        data = await self._execute_bearer_query("productSearchPageV2", variables)
+        if data.get("error"):
+            return ProductSearchResult(
+                products=[], count=0, query=query, store_id=store_id, data_source="bearer"
+            )
+        page = data.get("productSearchPageV2") or {}
+        components = (page.get("layout") or {}).get("visualComponents") or []
+        grid: dict[str, Any] = next(
+            (c for c in components if c.get("__typename") == "SearchGridV2"),
+            next((c for c in components if isinstance(c.get("items"), list)), {}),
+        )
+        products: list[Product] = []
+        for it in grid.get("items") or []:
+            try:
+                p = self._map_mobile_product(it)
+            except Exception:  # noqa: BLE001 - skip malformed items
+                continue
+            if p.name and (p.product_id or p.sku):
+                products.append(p)
+            if len(products) >= limit:
+                break
+        return ProductSearchResult(
+            products=products,
+            count=len(products),
+            query=query,
+            store_id=store_id,
+            data_source="bearer",
+        )
 
     async def get_cart(self) -> dict[str, Any]:
         """Get current cart contents.
