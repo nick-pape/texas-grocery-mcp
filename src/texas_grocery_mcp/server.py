@@ -116,6 +116,15 @@ async def lifespan(app: FastMCP) -> AsyncIterator[None]:
     """
     settings = get_settings()
 
+    # Seed the default store from config (HEB_DEFAULT_STORE) so tools that need a
+    # store work out of the box — notably the bearer/mobile path, which has no web
+    # session to infer a store from. Store tools can still override it at runtime.
+    if settings.heb_default_store:
+        from texas_grocery_mcp.state import StateManager
+
+        StateManager.set_default_store_id_sync(settings.heb_default_store)
+        logger.info("Default store seeded from config", store_id=settings.heb_default_store)
+
     # Startup: Check and refresh session if needed
     if settings.auto_refresh_on_startup:
         try:
