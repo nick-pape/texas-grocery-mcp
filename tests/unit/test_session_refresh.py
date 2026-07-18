@@ -73,8 +73,10 @@ def valid_session_cookies():
                 "localStorage": [
                     {
                         "name": "reese84",
+                        # Freshly issued: 600s left of an 850s (~14 min) lifetime,
+                        # i.e. ~70% remaining — healthy, no refresh recommended.
                         "value": json.dumps({
-                            "renewTime": (time.time() + 18000) * 1000,  # 5 hours from now (ms)
+                            "renewTime": (time.time() + 600) * 1000,
                             "renewInSec": 850,
                         }),
                     }
@@ -86,7 +88,8 @@ def valid_session_cookies():
 
 @pytest.fixture
 def expiring_soon_session_cookies():
-    """Create session cookies with token expiring within 4 hours."""
+    """Create session cookies with a reese84 token near the end of its own
+    lifetime (into the last SESSION_REFRESH_LIFETIME_FRACTION)."""
     future_time = time.time() + 86400  # 24 hours from now
     return {
         "cookies": [
@@ -111,11 +114,12 @@ def expiring_soon_session_cookies():
                 "localStorage": [
                     {
                         "name": "reese84",
-                        # 2 hours from now (< 4h threshold)
+                        # 60s left of a 660s (~11 min) lifetime — ~9% remaining,
+                        # inside the last SESSION_REFRESH_LIFETIME_FRACTION.
                         "value": json.dumps(
                             {
-                                "renewTime": (time.time() + 7200) * 1000,
-                                "renewInSec": 850,
+                                "renewTime": (time.time() + 60) * 1000,
+                                "renewInSec": 660,
                             }
                         ),
                     }
@@ -233,16 +237,19 @@ def test_get_session_status_valid_session(mock_auth_path, valid_session_cookies)
 
     assert result["authenticated"] is True
     assert result["needs_refresh"] is False
-    assert result["refresh_recommended"] is False  # > 4 hours remaining
+    # Most of the token's own lifetime remains → not recommended, even though
+    # (as reese84 always is) only minutes are left in absolute terms.
+    assert result["refresh_recommended"] is False
     assert result["time_remaining_hours"] is not None
-    assert result["time_remaining_hours"] > 4
+    assert result["time_remaining_hours"] > 0
     assert result["expires_at"] is not None
     assert result["reese84_present"] is True
     assert "healthy" in result["message"].lower()
 
 
 def test_get_session_status_refresh_recommended(mock_auth_path, expiring_soon_session_cookies):
-    """get_session_status should recommend refresh when < 4 hours remaining."""
+    """get_session_status should recommend refresh when the token is into the
+    last fraction of its own lifetime."""
     from texas_grocery_mcp.auth.session import get_session_status
 
     mock_auth_path.write_text(json.dumps(expiring_soon_session_cookies))
@@ -251,10 +258,53 @@ def test_get_session_status_refresh_recommended(mock_auth_path, expiring_soon_se
 
     assert result["authenticated"] is True
     assert result["needs_refresh"] is False
-    assert result["refresh_recommended"] is True  # < 4 hours remaining
+    assert result["refresh_recommended"] is True  # last fraction of its lifetime
     assert result["time_remaining_hours"] is not None
     assert result["time_remaining_hours"] < 4
     assert "expiring soon" in result["message"].lower() or "consider" in result["message"].lower()
+
+
+def _auth_with_reese84(renew_in_sec, remaining_sec):
+    """Build an authenticated auth-state blob whose reese84 token has the given
+    server-assigned lifetime and remaining time."""
+    future = time.time() + 86400
+    return {
+        "cookies": [
+            {"name": "sat", "value": "x", "domain": "www.heb.com", "path": "/", "expires": future},
+            {"name": "DYN_USER_ID", "value": "1", "domain": "www.heb.com", "path": "/", "expires": future},
+        ],
+        "origins": [
+            {
+                "origin": "https://www.heb.com",
+                "localStorage": [
+                    {
+                        "name": "reese84",
+                        "value": json.dumps({
+                            "renewTime": (time.time() + remaining_sec) * 1000,
+                            "renewInSec": renew_in_sec,
+                        }),
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_get_session_status_recommendation_scales_with_token_lifetime(mock_auth_path):
+    """refresh_recommended is proportional to the token's OWN lifetime, not an
+    absolute cutoff — so a token with MORE time remaining can be recommended
+    while one with LESS is not, purely because of their different lifetimes."""
+    from texas_grocery_mcp.auth.session import get_session_status
+
+    # 100s left of an 840s (~14 min) token → last ~12% of its life → recommended,
+    # even though 100s > the 70s below.
+    mock_auth_path.write_text(json.dumps(_auth_with_reese84(renew_in_sec=840, remaining_sec=100)))
+    assert get_session_status()["refresh_recommended"] is True
+
+    # 70s left of a 300s (5 min) token → still ~23% of its life → NOT recommended,
+    # despite having less absolute time remaining than the case above.
+    mock_auth_path.write_text(json.dumps(_auth_with_reese84(renew_in_sec=300, remaining_sec=70)))
+    assert get_session_status()["refresh_recommended"] is False
 
 
 def test_get_session_status_expired(mock_auth_path, expired_session_cookies):
@@ -345,7 +395,8 @@ async def test_session_status_valid_session(mock_auth_path, valid_session_cookie
 
 @pytest.mark.asyncio
 async def test_session_status_refresh_recommended(mock_auth_path, expiring_soon_session_cookies):
-    """session_status tool should recommend refresh when < 4 hours remaining."""
+    """session_status tool should recommend refresh when the token is into the
+    last fraction of its own lifetime."""
     from texas_grocery_mcp.tools.session import session_status
 
     mock_auth_path.write_text(json.dumps(expiring_soon_session_cookies))
