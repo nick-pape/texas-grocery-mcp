@@ -530,11 +530,18 @@ def get_session_account_email() -> str | None:
     return None
 
 
-# Refresh threshold: recommend refresh when less than this many hours remain.
-# reese84 itself renews every ~11 min (see reese84_keepwarm_interval_s), and the
-# background keepwarm loop refreshes it every ~9 min by default — so a multi-hour
-# threshold here just flags "recommended" permanently. Keep this below the
-# keepwarm/renewal gap so it only fires when keepwarm has actually fallen behind.
+# Recommend a proactive refresh once the reese84 token is into the last
+# SESSION_REFRESH_LIFETIME_FRACTION of its *own* server-assigned lifetime. HEB
+# stamps that lifetime per issuance (the token's renewInSec field; observed
+# ~5-14 min, and it varies per user/token) rather than fixing it, so any hardcoded
+# hours/minutes threshold is wrong in one direction or the other: too high and
+# "recommended" is pinned true forever, too low and short-lived tokens slip past.
+# Reading the lifetime from the token keeps the signal correct for any value HEB
+# assigns.
+SESSION_REFRESH_LIFETIME_FRACTION = 0.2
+
+# Fallback threshold (hours), used only when a token does not expose its lifetime
+# and remaining time therefore can't be expressed as a fraction of it.
 SESSION_REFRESH_THRESHOLD_HOURS = 0.05
 
 
@@ -543,7 +550,8 @@ def get_session_status() -> SessionStatus:
 
     Analyzes the reese84 bot detection token to determine:
     - How much time remains before the token expires
-    - Whether refresh is recommended (< SESSION_REFRESH_THRESHOLD_HOURS remaining)
+    - Whether refresh is recommended (token into the last fraction of its own
+      server-assigned lifetime; see SESSION_REFRESH_LIFETIME_FRACTION)
     - Whether refresh is required (expired)
 
     Returns:
@@ -607,12 +615,14 @@ def get_session_status() -> SessionStatus:
         server_timestamp = reese84_data.get("serverTimestamp")
 
         now = time.time()
+        remaining_seconds: float | None = None
+        # The token's own server-assigned lifetime, read straight from renewInSec.
+        lifetime_seconds: float | None = float(renew_in_sec) if renew_in_sec else None
 
         if renew_time_ms:
             # renewTime is absolute Unix timestamp in milliseconds
             renew_timestamp = renew_time_ms / 1000
             remaining_seconds = renew_timestamp - now
-            time_remaining_hours = remaining_seconds / 3600
             expires_at = datetime.fromtimestamp(
                 renew_timestamp, tz=UTC
             ).isoformat()
@@ -623,15 +633,32 @@ def get_session_status() -> SessionStatus:
             )
             renew_timestamp = server_ts + renew_in_sec
             remaining_seconds = renew_timestamp - now
-            time_remaining_hours = remaining_seconds / 3600
             expires_at = datetime.fromtimestamp(
                 renew_timestamp, tz=UTC
             ).isoformat()
 
-        if time_remaining_hours is not None:
-            needs_refresh = time_remaining_hours <= 0
-            # Recommend refresh when < threshold hours remaining
-            refresh_recommended = time_remaining_hours < SESSION_REFRESH_THRESHOLD_HOURS
+        # If renewInSec was absent, derive the lifetime from the issue->renew span.
+        if lifetime_seconds is None and renew_time_ms and server_timestamp:
+            server_ts = (
+                server_timestamp / 1000 if server_timestamp > 1e12 else server_timestamp
+            )
+            lifetime_seconds = (renew_time_ms / 1000) - server_ts
+
+        if remaining_seconds is not None:
+            time_remaining_hours = remaining_seconds / 3600
+            needs_refresh = remaining_seconds <= 0
+            if lifetime_seconds and lifetime_seconds > 0:
+                # Recommend refresh once the token is into the last
+                # SESSION_REFRESH_LIFETIME_FRACTION of its own lifetime.
+                refresh_recommended = (
+                    remaining_seconds
+                    < SESSION_REFRESH_LIFETIME_FRACTION * lifetime_seconds
+                )
+            else:
+                # Lifetime unknown — fall back to a small absolute floor.
+                refresh_recommended = (
+                    time_remaining_hours < SESSION_REFRESH_THRESHOLD_HOURS
+                )
 
     # Check cookies for session validity
     cookies = auth_data.get("cookies", [])
