@@ -530,8 +530,12 @@ def get_session_account_email() -> str | None:
     return None
 
 
-# Refresh threshold: recommend refresh when less than this many hours remain
-SESSION_REFRESH_THRESHOLD_HOURS = 4
+# Refresh threshold: recommend refresh when less than this many hours remain.
+# reese84 itself renews every ~11 min (see reese84_keepwarm_interval_s), and the
+# background keepwarm loop refreshes it every ~9 min by default — so a multi-hour
+# threshold here just flags "recommended" permanently. Keep this below the
+# keepwarm/renewal gap so it only fires when keepwarm has actually fallen behind.
+SESSION_REFRESH_THRESHOLD_HOURS = 0.05
 
 
 def get_session_status() -> SessionStatus:
@@ -539,7 +543,7 @@ def get_session_status() -> SessionStatus:
 
     Analyzes the reese84 bot detection token to determine:
     - How much time remains before the token expires
-    - Whether refresh is recommended (< 4 hours remaining)
+    - Whether refresh is recommended (< SESSION_REFRESH_THRESHOLD_HOURS remaining)
     - Whether refresh is required (expired)
 
     Returns:

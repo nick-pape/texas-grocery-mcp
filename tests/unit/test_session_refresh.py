@@ -86,7 +86,8 @@ def valid_session_cookies():
 
 @pytest.fixture
 def expiring_soon_session_cookies():
-    """Create session cookies with token expiring within 4 hours."""
+    """Create session cookies with a reese84 token expiring within the
+    keep-warm threshold (SESSION_REFRESH_THRESHOLD_HOURS)."""
     future_time = time.time() + 86400  # 24 hours from now
     return {
         "cookies": [
@@ -111,11 +112,12 @@ def expiring_soon_session_cookies():
                 "localStorage": [
                     {
                         "name": "reese84",
-                        # 2 hours from now (< 4h threshold)
+                        # ~1 min from now (< SESSION_REFRESH_THRESHOLD_HOURS,
+                        # which is 0.05h/3min; reese84 tokens only live ~11 min)
                         "value": json.dumps(
                             {
-                                "renewTime": (time.time() + 7200) * 1000,
-                                "renewInSec": 850,
+                                "renewTime": (time.time() + 60) * 1000,
+                                "renewInSec": 60,
                             }
                         ),
                     }
@@ -233,7 +235,7 @@ def test_get_session_status_valid_session(mock_auth_path, valid_session_cookies)
 
     assert result["authenticated"] is True
     assert result["needs_refresh"] is False
-    assert result["refresh_recommended"] is False  # > 4 hours remaining
+    assert result["refresh_recommended"] is False  # well above threshold
     assert result["time_remaining_hours"] is not None
     assert result["time_remaining_hours"] > 4
     assert result["expires_at"] is not None
@@ -242,7 +244,7 @@ def test_get_session_status_valid_session(mock_auth_path, valid_session_cookies)
 
 
 def test_get_session_status_refresh_recommended(mock_auth_path, expiring_soon_session_cookies):
-    """get_session_status should recommend refresh when < 4 hours remaining."""
+    """get_session_status should recommend refresh when under the keep-warm threshold."""
     from texas_grocery_mcp.auth.session import get_session_status
 
     mock_auth_path.write_text(json.dumps(expiring_soon_session_cookies))
@@ -251,7 +253,7 @@ def test_get_session_status_refresh_recommended(mock_auth_path, expiring_soon_se
 
     assert result["authenticated"] is True
     assert result["needs_refresh"] is False
-    assert result["refresh_recommended"] is True  # < 4 hours remaining
+    assert result["refresh_recommended"] is True  # under keep-warm threshold
     assert result["time_remaining_hours"] is not None
     assert result["time_remaining_hours"] < 4
     assert "expiring soon" in result["message"].lower() or "consider" in result["message"].lower()
@@ -345,7 +347,7 @@ async def test_session_status_valid_session(mock_auth_path, valid_session_cookie
 
 @pytest.mark.asyncio
 async def test_session_status_refresh_recommended(mock_auth_path, expiring_soon_session_cookies):
-    """session_status tool should recommend refresh when < 4 hours remaining."""
+    """session_status tool should recommend refresh when under the keep-warm threshold."""
     from texas_grocery_mcp.tools.session import session_status
 
     mock_auth_path.write_text(json.dumps(expiring_soon_session_cookies))
